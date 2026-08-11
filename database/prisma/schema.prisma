@@ -1,0 +1,523 @@
+// Prisma Schema for Coding Event Platform 2026
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// ==========================================
+// ENUMS
+// ==========================================
+
+enum UserRole {
+  ADMIN
+  STUDENT
+}
+
+enum EventStatus {
+  DRAFT
+  READY
+  LIVE
+  PAUSED
+  ENDED
+}
+
+enum RoundType {
+  MCQ
+  OUTPUT_PREDICTION
+  DEBUGGING
+  PROGRAMMING
+}
+
+enum RoundStatus {
+  DRAFT
+  READY
+  LIVE
+  PAUSED
+  ENDED
+}
+
+enum QuestionType {
+  MCQ
+  MULTIPLE_CHOICE
+  OUTPUT_PREDICTION
+}
+
+enum ComparisonMethod {
+  EXACT
+  EXACT_IGNORE_CASE
+  TRIM
+  REGEX
+}
+
+enum TestCaseVisibility {
+  VISIBLE
+  HIDDEN
+}
+
+enum ProgrammingLanguage {
+  C
+  JAVA
+  CPP
+  PYTHON
+}
+
+enum RoundProgressStatus {
+  NOT_STARTED
+  IN_PROGRESS
+  PAUSED
+  SUBMITTED
+  LOCKED
+}
+
+enum ViolationType {
+  FULLSCREEN_EXIT
+  TAB_SWITCH
+  WINDOW_BLUR
+  OTHER
+}
+
+// ==========================================
+// USERS, ROLES & AUTHENTICATION
+// ==========================================
+
+model User {
+  id           String     @id @default(uuid())
+  email        String?    @unique
+  username     String     @unique
+  passwordHash String
+  role         UserRole   @default(STUDENT)
+  isActive     Boolean    @default(true)
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+
+  student      Student?
+  admin        Admin?
+  sessions     Session[]
+  auditLogs    AuditLog[]
+}
+
+model Student {
+  id          String   @id @default(uuid())
+  userId      String   @unique
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  studentId   String   @unique
+  fullName    String
+  batchNumber String
+  batchId     String?
+  batch       Batch?   @relation(fields: [batchId], references: [id], onDelete: SetNull)
+  status      String   @default("ACTIVE")
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  answers              StudentAnswer[]
+  debuggingSubmissions DebuggingSubmission[]
+  programmingSubmissions ProgrammingSubmission[]
+  bugAwards            BugAward[]
+  progresses           RoundProgress[]
+  scores               RoundScore[]
+  finalScore           FinalScore?
+  violations           Violation[]
+
+  @@index([studentId])
+  @@index([batchNumber])
+}
+
+model Admin {
+  id        String   @id @default(uuid())
+  userId    String   @unique
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name      String
+  metadata  Json?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Batch {
+  id          String    @id @default(uuid())
+  batchNumber String    @unique
+  name        String
+  description String?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  students    Student[]
+
+  @@index([batchNumber])
+}
+
+// ==========================================
+// EVENT & ROUND STRUCTURE
+// ==========================================
+
+model Event {
+  id          String      @id @default(uuid())
+  name        String
+  description String?
+  status      EventStatus @default(DRAFT)
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+
+  rounds      Round[]
+  settings    EventSettings?
+  visibility  VisibilitySettings?
+}
+
+model EventSettings {
+  id                      String   @id @default(uuid())
+  eventId                 String   @unique
+  event                   Event    @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  maximumViolations       Int      @default(3)
+  continuationPasswordHash String?
+  singleSession           Boolean  @default(true)
+  createdAt               DateTime @default(now())
+  updatedAt               DateTime @updatedAt
+}
+
+model VisibilitySettings {
+  id          String   @id @default(uuid())
+  eventId     String   @unique
+  event       Event    @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  showAnswers Boolean  @default(false)
+  showResults Boolean  @default(false)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model Round {
+  id               String      @id @default(uuid())
+  eventId          String
+  event            Event       @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  name             String
+  type             RoundType
+  description      String?
+  order            Int
+  duration         Int
+  maximumMarks     Int
+  status           RoundStatus @default(DRAFT)
+  isEnabled        Boolean     @default(true)
+  startTime        DateTime?
+  endTime          DateTime?
+  remainingSeconds Int?
+  createdAt        DateTime    @default(now())
+  updatedAt        DateTime    @updatedAt
+
+  questions          Question[]
+  debuggingProblems  DebuggingProblem[]
+  programmingProblems ProgrammingProblem[]
+  progresses         RoundProgress[]
+  scores             RoundScore[]
+  violations         Violation[]
+
+  @@unique([eventId, order])
+  @@index([eventId])
+  @@index([eventId, order])
+  @@index([status])
+}
+
+// ==========================================
+// ROUND 1: QUESTIONS & ANSWERS
+// ==========================================
+
+model Question {
+  id               String           @id @default(uuid())
+  roundId          String
+  round            Round            @relation(fields: [roundId], references: [id], onDelete: Cascade)
+  questionText     String
+  questionType     QuestionType
+  marks            Int
+  negativeMarks    Int              @default(0)
+  order            Int
+  isActive         Boolean          @default(true)
+  correctAnswer    String?
+  code             String?
+  correctOutput    String?
+  comparisonMethod ComparisonMethod @default(EXACT)
+  createdAt        DateTime         @default(now())
+  updatedAt        DateTime         @updatedAt
+
+  options        QuestionOption[]
+  studentAnswers StudentAnswer[]
+
+  @@index([roundId])
+  @@index([roundId, order])
+}
+
+model QuestionOption {
+  id         String   @id @default(uuid())
+  questionId String
+  question   Question @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  optionKey  String
+  optionText String
+  order      Int
+
+  @@unique([questionId, optionKey])
+  @@index([questionId])
+}
+
+model StudentAnswer {
+  id          String   @id @default(uuid())
+  studentId   String
+  student     Student  @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  questionId  String
+  question    Question @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  answer      String
+  submittedAt DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@unique([studentId, questionId])
+  @@index([studentId])
+  @@index([questionId])
+}
+
+// ==========================================
+// ROUND 2: DEBUGGING PROBLEMS & BUGS
+// ==========================================
+
+model DebuggingProblem {
+  id           String    @id @default(uuid())
+  roundId      String
+  round        Round     @relation(fields: [roundId], references: [id], onDelete: Cascade)
+  title        String
+  description  String
+  buggyCode    String
+  solutionCode String?
+  starterCode  String?
+  maximumMarks Int
+  timeLimit    Int
+  memoryLimit  Int
+  isActive     Boolean   @default(true)
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  bugDefinitions BugDefinition[]
+  submissions    DebuggingSubmission[]
+
+  @@index([roundId])
+}
+
+model BugDefinition {
+  id                 String           @id @default(uuid())
+  debuggingProblemId String
+  problem            DebuggingProblem @relation(fields: [debuggingProblemId], references: [id], onDelete: Cascade)
+  bugId              String
+  title              String
+  description        String?
+  marks              Int
+  validationConfig   Json?
+  order              Int
+  isActive           Boolean          @default(true)
+
+  bugAwards BugAward[]
+
+  @@unique([debuggingProblemId, bugId])
+  @@index([debuggingProblemId])
+}
+
+model BugAward {
+  id                    String        @id @default(uuid())
+  studentId             String
+  student               Student       @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  bugDefinitionId       String
+  bugDefinition         BugDefinition @relation(fields: [bugDefinitionId], references: [id], onDelete: Cascade)
+  debuggingSubmissionId String?
+  marksAwarded          Int
+  awardedAt             DateTime      @default(now())
+
+  @@unique([studentId, bugDefinitionId])
+  @@index([studentId])
+  @@index([bugDefinitionId])
+}
+
+model DebuggingSubmission {
+  id                 String           @id @default(uuid())
+  studentId          String
+  student            Student          @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  debuggingProblemId String
+  problem            DebuggingProblem @relation(fields: [debuggingProblemId], references: [id], onDelete: Cascade)
+  submittedCode      String
+  submissionNumber   Int
+  compileStatus      String?
+  compileOutput      String?
+  executionOutput    String?
+  executionTime      Int?
+  memoryUsed         Int?
+  score              Int              @default(0)
+  submittedAt        DateTime         @default(now())
+
+  @@index([studentId])
+  @@index([debuggingProblemId])
+  @@index([studentId, debuggingProblemId])
+}
+
+// ==========================================
+// ROUND 3: PROGRAMMING PROBLEMS & TESTCASES
+// ==========================================
+
+model ProgrammingProblem {
+  id                 String   @id @default(uuid())
+  roundId            String
+  round              Round    @relation(fields: [roundId], references: [id], onDelete: Cascade)
+  title              String
+  description        String
+  inputFormat        String?
+  outputFormat       String?
+  constraints        String?
+  examples           Json?
+  starterCode        String?
+  supportedLanguages String[]
+  maximumMarks       Int
+  timeLimit          Int
+  memoryLimit        Int
+  isActive           Boolean  @default(true)
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  testCases   TestCase[]
+  submissions ProgrammingSubmission[]
+
+  @@index([roundId])
+}
+
+model TestCase {
+  id                   String             @id @default(uuid())
+  programmingProblemId String
+  problem              ProgrammingProblem @relation(fields: [programmingProblemId], references: [id], onDelete: Cascade)
+  input                String
+  expectedOutput       String
+  marks                Int
+  visibility           TestCaseVisibility @default(VISIBLE)
+  order                Int
+  isActive             Boolean            @default(true)
+
+  @@index([programmingProblemId])
+}
+
+model ProgrammingSubmission {
+  id                   String             @id @default(uuid())
+  studentId            String
+  student              Student            @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  programmingProblemId String
+  problem              ProgrammingProblem @relation(fields: [programmingProblemId], references: [id], onDelete: Cascade)
+  language             ProgrammingLanguage
+  submittedCode        String
+  submissionNumber     Int
+  compileStatus        String?
+  compileOutput        String?
+  executionOutput      String?
+  passedTests          Int                @default(0)
+  totalTests           Int                @default(0)
+  score                Int                @default(0)
+  executionTime        Int?
+  memoryUsed           Int?
+  compileAttempts      Int                @default(0)
+  runAttempts          Int                @default(0)
+  submissionStatus     String             @default("PENDING")
+  submittedAt          DateTime           @default(now())
+
+  @@index([studentId])
+  @@index([programmingProblemId])
+  @@index([studentId, programmingProblemId])
+}
+
+// ==========================================
+// PROGRESS, SCORES & VIOLATIONS
+// ==========================================
+
+model RoundProgress {
+  id          String              @id @default(uuid())
+  studentId   String
+  student     Student             @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  roundId     String
+  round       Round               @relation(fields: [roundId], references: [id], onDelete: Cascade)
+  status      RoundProgressStatus @default(NOT_STARTED)
+  startedAt   DateTime?
+  lastSavedAt DateTime?
+  submittedAt DateTime?
+  lockedAt    DateTime?
+  stateData   Json?
+
+  @@unique([studentId, roundId])
+  @@index([studentId])
+  @@index([roundId])
+}
+
+model RoundScore {
+  id           String   @id @default(uuid())
+  studentId    String
+  student      Student  @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  roundId      String
+  round        Round    @relation(fields: [roundId], references: [id], onDelete: Cascade)
+  score        Int
+  maximumScore Int
+  submittedAt  DateTime @default(now())
+  calculatedAt DateTime @default(now())
+
+  @@unique([studentId, roundId])
+  @@index([studentId])
+  @@index([roundId])
+}
+
+model FinalScore {
+  id          String   @id @default(uuid())
+  studentId   String   @unique
+  student     Student  @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  round1Score Int      @default(0)
+  round2Score Int      @default(0)
+  round3Score Int      @default(0)
+  totalScore  Int      @default(0)
+  rank        Int?
+  status      String   @default("PENDING")
+  calculatedAt DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model Violation {
+  id        String        @id @default(uuid())
+  studentId String
+  student   Student       @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  roundId   String
+  round     Round         @relation(fields: [roundId], references: [id], onDelete: Cascade)
+  type      ViolationType
+  details   String?
+  timestamp DateTime      @default(now())
+
+  @@index([studentId])
+  @@index([roundId])
+}
+
+// ==========================================
+// AUDIT & SESSIONS
+// ==========================================
+
+model Session {
+  id           String    @id @default(uuid())
+  userId       String
+  user         User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  sessionToken String    @unique
+  createdAt    DateTime  @default(now())
+  expiresAt    DateTime
+  revokedAt    DateTime?
+  lastSeenAt   DateTime  @default(now())
+
+  @@index([userId])
+  @@index([sessionToken])
+}
+
+model AuditLog {
+  id        String   @id @default(uuid())
+  userId    String?
+  user      User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  action    String
+  entity    String
+  entityId  String?
+  metadata  Json?
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@index([createdAt])
+}

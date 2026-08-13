@@ -1,5 +1,5 @@
 import { query, queryOne, transaction, txQuery, txQueryOne, txExecute } from '../config/database';
-import { RoundType, DbEvent, DbRound, DbStudent, DbFinalScore, DbVisibilitySettings, DbRoundScore, DbProgrammingSubmission, DbDebuggingSubmission, DbStudentAnswer, DbRoundProgress, DbViolation, DbAuditLog } from '../config/types';
+import { RoundType, DbEvent, DbRound, DbStudent, DbFinalScore, DbVisibilitySettings, DbRoundScore, DbProgrammingSubmission, DbDebuggingSubmission, DbStudentAnswer, DbRoundProgress, DbViolation, DbAuditLog, DbBugAward } from '../config/types';
 
 export class CompetitionService {
   private async getPrimaryEventId(): Promise<string> {

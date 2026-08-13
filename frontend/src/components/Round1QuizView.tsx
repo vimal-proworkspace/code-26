@@ -20,7 +20,7 @@ export const Round1QuizView: React.FC<Round1QuizViewProps> = ({ roundId, onSubmi
   const [submitting, setSubmitting] = useState<boolean>(false);
   const [submitResult, setSubmitResult] = useState<SubmitRound1Response | null>(null);
 
-  const saveDebounceTimers = useRef<Record<string, NodeJS.Timeout>>({});
+  const saveDebounceTimers = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
 
   // 1. Fetch Quiz Data on Mount
   const fetchQuiz = async () => {

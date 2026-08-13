@@ -31,6 +31,10 @@ async function runVerification() {
       );
     }
 
+    if (!round2) {
+      throw new Error('Failed to resolve Round 2 for verification');
+    }
+
     // 2. Get test Student (SARA-001)
     const student = await queryOne<DbStudent>(`SELECT * FROM students WHERE "studentId" = 'SARA-001'`);
     if (!student) {

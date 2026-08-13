@@ -1,4 +1,4 @@
-import { Pool, PoolClient, QueryResult } from 'pg';
+import { Pool, PoolClient, QueryResult, QueryResultRow } from 'pg';
 
 // Parse the DATABASE_URL from environment (loaded by env.ts before this module is used)
 const connectionString = process.env.DATABASE_URL;
@@ -26,7 +26,7 @@ pool.on('error', (err) => {
 /**
  * Execute a parameterized SQL query and return all rows.
  */
-export async function query<T = any>(text: string, params?: any[]): Promise<T[]> {
+export async function query<T extends QueryResultRow = QueryResultRow>(text: string, params?: any[]): Promise<T[]> {
   const result: QueryResult<T> = await pool.query<T>(text, params);
   return result.rows;
 }
@@ -34,7 +34,7 @@ export async function query<T = any>(text: string, params?: any[]): Promise<T[]>
 /**
  * Execute a parameterized SQL query and return the first row or null.
  */
-export async function queryOne<T = any>(text: string, params?: any[]): Promise<T | null> {
+export async function queryOne<T extends QueryResultRow = QueryResultRow>(text: string, params?: any[]): Promise<T | null> {
   const result: QueryResult<T> = await pool.query<T>(text, params);
   return result.rows[0] || null;
 }
@@ -69,7 +69,7 @@ export async function transaction<T>(fn: (client: PoolClient) => Promise<T>): Pr
 /**
  * Helper: query within a transaction client
  */
-export async function txQuery<T = any>(client: PoolClient, text: string, params?: any[]): Promise<T[]> {
+export async function txQuery<T extends QueryResultRow = QueryResultRow>(client: PoolClient, text: string, params?: any[]): Promise<T[]> {
   const result: QueryResult<T> = await client.query<T>(text, params);
   return result.rows;
 }
@@ -77,7 +77,7 @@ export async function txQuery<T = any>(client: PoolClient, text: string, params?
 /**
  * Helper: query one row within a transaction client
  */
-export async function txQueryOne<T = any>(client: PoolClient, text: string, params?: any[]): Promise<T | null> {
+export async function txQueryOne<T extends QueryResultRow = QueryResultRow>(client: PoolClient, text: string, params?: any[]): Promise<T | null> {
   const result: QueryResult<T> = await client.query<T>(text, params);
   return result.rows[0] || null;
 }

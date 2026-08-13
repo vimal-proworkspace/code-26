@@ -84,6 +84,7 @@ export interface DbSession {
   createdAt: Date;
   expiresAt: Date;
   revokedAt: Date | null;
+  isRevoked: boolean;
   lastSeenAt: Date;
 }
 

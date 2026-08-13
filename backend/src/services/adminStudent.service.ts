@@ -1,6 +1,6 @@
 import { query, queryOne, execute } from '../config/database';
 import { isStudentOnline } from '../socket';
-import { RoundStatus, RoundProgressStatus, QuestionType, DbStudent, DbRound, DbRoundProgress, DbQuestion, DbStudentAnswer, DbQuestionOption, DbDebuggingSubmission, DbProgrammingSubmission, DbViolation, DbAuditLog } from '../config/types';
+import { RoundStatus, RoundProgressStatus, QuestionType, DbStudent, DbRound, DbRoundProgress, DbRoundScore, DbQuestion, DbStudentAnswer, DbQuestionOption, DbDebuggingSubmission, DbProgrammingSubmission, DbViolation, DbAuditLog } from '../config/types';
 
 export interface StudentListQueryOptions {
   search?: string;

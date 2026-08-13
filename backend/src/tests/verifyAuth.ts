@@ -4,6 +4,7 @@
  * Usage: npx ts-node src/tests/verifyAuth.ts
  */
 
+import '../config/env';
 import { authService } from '../services/auth.service';
 import { verifyAuthToken } from '../utils/jwt';
 import { queryOne, closePool } from '../config/database';
@@ -100,10 +101,13 @@ async function main() {
   let newStudentId = '';
   await runTest('Student Registration: Valid Batch 284001', async () => {
     const res = await authService.registerStudent('Verification Test Student', '284001');
-    assert(!!res.studentId, 'Student ID should be assigned');
-    assert(res.studentId.startsWith('SARA-'), `Student ID should start with SARA-, got ${res.studentId}`);
-    assert(res.batchNumber === '284001', 'Batch number should match');
-    newStudentId = res.studentId;
+    assert(res.user.role === 'STUDENT', `Expected STUDENT role, got ${res.user.role}`);
+    assert(!!res.user.studentId, 'Student ID should be assigned');
+    assert(res.user.studentId!.startsWith('SARA-'), `Student ID should start with SARA-, got ${res.user.studentId}`);
+    assert(res.user.batch === '284001', 'Batch number should match');
+    assert(!!res.token, 'Token should be issued on registration');
+    assert(!!res.sessionId, 'Session ID should be returned on registration');
+    newStudentId = res.user.studentId!;
   });
 
   await runTest('Registered Student Login', async () => {
@@ -114,8 +118,9 @@ async function main() {
 
   await runTest('Student Registration: Valid Custom 6-Digit Batch 123456', async () => {
     const res = await authService.registerStudent('Verification Test Student 2', '123456');
-    assert(!!res.studentId, 'Student ID should be assigned');
-    assert(res.batchNumber === '123456', 'Batch number should match 123456');
+    assert(!!res.user.studentId, 'Student ID should be assigned');
+    assert(res.user.batch === '123456', 'Batch number should match 123456');
+    assert(!!res.token, 'Token should be issued on registration');
   });
 
   await runTest('Student Registration: Batch validation failure (short/non-digit)', async () => {

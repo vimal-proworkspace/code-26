@@ -1,19 +1,18 @@
 import React, { useState, useEffect } from 'react';
 import { useSocket } from '../context/SocketContext';
-import { adminStudentApi, StudentListItem, StudentListResponse, StudentDetailResponse } from '../services/adminStudentApi';
+import { adminStudentApi, StudentListResponse, StudentDetailResponse } from '../services/adminStudentApi';
 import { violationApi } from '../services/violationApi';
 
 export const StudentManagementTab: React.FC = () => {
-  const { isConnected, adminMetrics } = useSocket();
+  const { adminMetrics } = useSocket();
   const [data, setData] = useState<StudentListResponse | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
-  const [error, setError] = useState<string | null>(null);
 
   // Search & Filter State
   const [search, setSearch] = useState<string>('');
   const [statusFilter, setStatusFilter] = useState<string>('ALL');
   const [sortBy, setSortBy] = useState<string>('studentId');
-  const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>('asc');
+  const [sortOrder] = useState<'asc' | 'desc'>('asc');
   const [page, setPage] = useState<number>(1);
   const [limit, setLimit] = useState<number>(25);
 
@@ -36,9 +35,8 @@ export const StudentManagementTab: React.FC = () => {
         sortOrder,
       });
       setData(res);
-      setError(null);
     } catch (err: any) {
-      setError(err.message || 'Failed to fetch student management list');
+      console.error('Failed to fetch student management list:', err.message);
     } finally {
       setLoading(false);
     }

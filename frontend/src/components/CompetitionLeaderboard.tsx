@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { competitionApi, AdminLeaderboardResponse, LeaderboardItem } from '../services/competitionApi';
+import { competitionApi, AdminLeaderboardResponse } from '../services/competitionApi';
 
 export const CompetitionLeaderboard: React.FC = () => {
   const [data, setData] = useState<AdminLeaderboardResponse | null>(null);
@@ -275,7 +275,7 @@ export const CompetitionLeaderboard: React.FC = () => {
                   </h4>
                   {inspectionData.programmingSubmissions && inspectionData.programmingSubmissions.length > 0 ? (
                     <div style={{ backgroundColor: '#0f172a', padding: '0.75rem', borderRadius: '0.5rem' }}>
-                      {inspectionData.programmingSubmissions.map((sub: any, idx: number) => (
+                      {inspectionData.programmingSubmissions.map((sub: any) => (
                         <div key={sub.id} style={{ borderBottom: '1px solid #334155', padding: '0.5rem 0', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                           <div>
                             <span style={{ color: '#c084fc', fontWeight: 'bold' }}>#{sub.submissionNumber} ({sub.language})</span>

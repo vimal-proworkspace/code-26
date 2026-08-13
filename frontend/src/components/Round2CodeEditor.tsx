@@ -25,7 +25,7 @@ export const Round2CodeEditor: React.FC<Round2CodeEditorProps> = ({ roundId, isP
   const [showSubmitModal, setShowSubmitModal] = useState<boolean>(false);
   const [remainingSeconds, setRemainingSeconds] = useState<number>(0);
 
-  const saveTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const saveTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Load Round 2 student workspace data
   const loadWorkspace = async () => {
@@ -492,7 +492,7 @@ const styles: Record<string, React.CSSProperties> = {
   },
   editorToolbar: {
     display: 'flex',
-    justify: 'space-between',
+    justifyContent: 'space-between',
     alignItems: 'center',
     padding: '0.5rem 1rem',
     backgroundColor: '#0f172a',

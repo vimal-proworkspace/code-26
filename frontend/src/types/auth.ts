@@ -20,9 +20,7 @@ export interface AuthResponse {
 export interface RegisterResponse {
   status: 'success' | 'error';
   data?: {
-    studentId: string;
-    fullName: string;
-    batchNumber: string;
+    user: SafeUser;
   };
   message?: string;
 }

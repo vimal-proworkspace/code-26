@@ -147,7 +147,7 @@ async function runVerification() {
 
     // 15. Test Admin Student Inspection Tool
     const inspection = await competitionService.getAdminStudentInspection(student.studentId);
-    if (!inspection || inspection.studentInfo?.studentId !== student.studentId) {
+    if (!inspection || inspection.studentId !== student.studentId) {
       throw new Error('Admin student inspection failed!');
     }
     console.log(`✓ Admin student inspection verified for ${student.studentId}.`);

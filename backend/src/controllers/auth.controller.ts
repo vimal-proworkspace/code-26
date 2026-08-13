@@ -45,9 +45,13 @@ export class AuthController {
       const { fullName, batchNumber } = req.body || {};
       const result = await authService.registerStudent(fullName, batchNumber);
 
+      setAuthCookie(res, result.token);
+
       res.status(201).json({
         status: 'success',
-        data: result,
+        data: {
+          user: result.user,
+        },
       });
     } catch (err) {
       next(err);

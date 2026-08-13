@@ -5,7 +5,6 @@ import { Round1QuizView } from '../components/Round1QuizView';
 import { Round2CodeEditor } from '../components/Round2CodeEditor';
 import { Round3CodeEditor } from '../components/Round3CodeEditor';
 import { NetworkStatusBanner } from '../components/NetworkStatusBanner';
-import { CompetitionTimerHeader } from '../components/CompetitionTimerHeader';
 import { apiFetch } from '../services/api';
 import { competitionApi, StudentResultsResponse } from '../services/competitionApi';
 import { violationApi, ViolationStatusResponse } from '../services/violationApi';
@@ -27,7 +26,6 @@ export const StudentDashboard: React.FC = () => {
   const { user, logout } = useAuth();
   const { isConnected, roundState: socketRoundState } = useSocket();
   const [rounds, setRounds] = useState<StudentRoundInfo[]>([]);
-  const [loading, setLoading] = useState<boolean>(true);
   const [resultsData, setResultsData] = useState<StudentResultsResponse | null>(null);
   const [fullscreenWarning, setFullscreenWarning] = useState<boolean>(false);
   const [violationState, setViolationState] = useState<ViolationStatusResponse>({
@@ -49,8 +47,6 @@ export const StudentDashboard: React.FC = () => {
       }
     } catch (err) {
       console.error('Failed to fetch current rounds status:', err);
-    } finally {
-      setLoading(false);
     }
   };
 

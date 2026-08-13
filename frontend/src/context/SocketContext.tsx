@@ -63,7 +63,7 @@ export const SocketProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       setRoundState(data);
     };
 
-    const onRoundPaused = (data: { roundId: string; status: 'PAUSED' }) => {
+    const onRoundPaused = (_data: { roundId: string; status: 'PAUSED' }) => {
       setRoundState((prev) => (prev ? { ...prev, status: 'PAUSED' } : null));
     };
 
@@ -80,11 +80,11 @@ export const SocketProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       );
     };
 
-    const onRoundEnded = (data: { roundId: string; status: 'ENDED' }) => {
+    const onRoundEnded = (_data: { roundId: string; status: 'ENDED' }) => {
       setRoundState((prev) => (prev ? { ...prev, status: 'ENDED' } : null));
     };
 
-    const onRoundRestarted = (data: { roundId: string; status: 'READY' }) => {
+    const onRoundRestarted = (_data: { roundId: string; status: 'READY' }) => {
       setRoundState(null);
     };
 

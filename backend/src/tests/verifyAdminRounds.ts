@@ -68,15 +68,18 @@ async function main() {
     const updated = await adminRoundService.updateRound(createdRoundId, {
       description: 'Updated description for test round',
     });
+    if (!updated) throw new Error('updateRound returned null');
     assert(updated.description === 'Updated description for test round', 'Description should be updated');
   });
 
   await runTest('Toggle Round Enabled/Disabled', async () => {
     assert(!!createdRoundId, 'Created round ID required');
     const disabled = await adminRoundService.toggleRoundEnabled(createdRoundId, false);
+    if (!disabled) throw new Error('toggleRoundEnabled returned null');
     assert(disabled.isEnabled === false, 'Round should be disabled');
 
     const enabled = await adminRoundService.toggleRoundEnabled(createdRoundId, true);
+    if (!enabled) throw new Error('toggleRoundEnabled returned null');
     assert(enabled.isEnabled === true, 'Round should be re-enabled');
   });
 

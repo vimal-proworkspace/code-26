@@ -1,5 +1,6 @@
 import { query, queryOne, execute } from '../config/database';
 import { DbRound } from '../config/types';
+import { SQL } from '../config/schemaSql';
 import { broadcastRoundEnded } from './index';
 
 let deadlineInterval: NodeJS.Timeout | null = null;
@@ -19,7 +20,7 @@ export const startDeadlineChecker = () => {
 
       // Find LIVE rounds whose deadline has passed
       const expiredRounds = await query<DbRound>(
-        `SELECT * FROM rounds WHERE status = 'LIVE' AND "endTime" <= $1`,
+        `${SQL.ROUND_SELECT} WHERE state = 'LIVE' AND "endTime" <= $1`,
         [now]
       );
 
@@ -27,8 +28,13 @@ export const startDeadlineChecker = () => {
         console.log(`[DeadlineChecker] Round ${round.name} (${round.id}) deadline reached. Auto-ending round...`);
 
         // Atomically update round status to ENDED
+        await queryOne(
+          `UPDATE rounds SET state = 'ENDED', "updatedAt" = NOW() WHERE id = $1 RETURNING id`,
+          [round.id]
+        );
+
         const updatedRound = await queryOne<DbRound>(
-          `UPDATE rounds SET status = 'ENDED', "updatedAt" = NOW() WHERE id = $1 RETURNING *`,
+          `${SQL.ROUND_SELECT} WHERE id = $1`,
           [round.id]
         );
 
@@ -42,9 +48,8 @@ export const startDeadlineChecker = () => {
 
         // Log audit record
         await query(
-          `INSERT INTO audit_logs (id, action, entity, "entityId", metadata, "createdAt")
-           VALUES (gen_random_uuid(), 'ROUND_AUTO_ENDED_DEADLINE', 'Round', $1, $2, NOW())`,
-          [round.id, JSON.stringify({ name: round.name, endTime: round.endTime })]
+          SQL.AUDIT_INSERT,
+          ['ROUND_AUTO_ENDED_DEADLINE', 'Round', round.id, null, JSON.stringify({ name: round.name, endTime: round.endTime })]
         );
 
         // Broadcast ROUND_ENDED via Socket.IO

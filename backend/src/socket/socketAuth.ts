@@ -51,18 +51,18 @@ export const socketAuthMiddleware = async (socket: AuthenticatedSocket, next: (e
     }
 
     // 4. Verify session in PostgreSQL database
-    const dbSession = await queryOne<DbSession & { user_id: string; user_role: UserRole; user_username: string; user_isActive: boolean; student_studentId: string | null }>(
-      `SELECT s.*,
+    const dbSession = await queryOne<DbSession & { user_id: string; user_role: UserRole; user_username: string; user_isActive: boolean; student_studentId: string | null; isRevoked: boolean }>(
+      `SELECT s.id, s."userId", s."tokenJti" AS "sessionToken", s."createdAt", s."expiresAt",
+              s."revokedAt", s."isRevoked", s."updatedAt" AS "lastSeenAt",
               u.id as user_id, u.role as user_role, u.username as user_username, u."isActive" as "user_isActive",
-              st."studentId" as "student_studentId"
+              u."studentId" as "student_studentId"
        FROM sessions s
        JOIN users u ON u.id = s."userId"
-       LEFT JOIN students st ON st."userId" = u.id
        WHERE s.id = $1`,
       [payload.sessionId]
     );
 
-    if (!dbSession || dbSession.revokedAt || new Date(dbSession.expiresAt) < new Date()) {
+    if (!dbSession || dbSession.isRevoked || dbSession.revokedAt || new Date(dbSession.expiresAt) < new Date()) {
       return next(new Error('Session expired or revoked'));
     }
 

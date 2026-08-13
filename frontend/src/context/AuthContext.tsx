@@ -8,7 +8,7 @@ export interface AuthContextType {
   error: string | null;
   loginStudent: (studentId: string, password: string) => Promise<SafeUser>;
   loginAdmin: (username: string, password: string) => Promise<SafeUser>;
-  registerStudent: (fullName: string, batchNumber: string) => Promise<{ studentId: string; fullName: string; batchNumber: string }>;
+  registerStudent: (fullName: string, batchNumber: string) => Promise<SafeUser>;
   logout: () => Promise<void>;
   clearError: () => void;
 }
@@ -72,12 +72,13 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
     }
   };
 
-  const registerStudent = async (fullName: string, batchNumber: string) => {
+  const registerStudent = async (fullName: string, batchNumber: string): Promise<SafeUser> => {
     setError(null);
     try {
       const res = await api.registerStudent(fullName, batchNumber);
-      if (res.data) {
-        return res.data;
+      if (res.data?.user) {
+        setUser(res.data.user);
+        return res.data.user;
       }
       throw new Error(res.message || 'Registration failed');
     } catch (err: any) {

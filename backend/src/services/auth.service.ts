@@ -2,6 +2,7 @@ import bcrypt from 'bcrypt';
 import crypto from 'crypto';
 import { query, queryOne, transaction, txQuery, txQueryOne, txExecute } from '../config/database';
 import { UserRole, DbUser, DbStudent, DbSession, DbAdmin } from '../config/types';
+import { SQL } from '../config/schemaSql';
 import { signAuthToken } from '../utils/jwt';
 import { config } from '../config/env';
 
@@ -30,8 +31,7 @@ export class AuthService {
   private async logAudit(action: string, entity: string, entityId?: string, userId?: string, metadata?: Record<string, unknown>) {
     try {
       await query(
-        `INSERT INTO audit_logs (id, action, entity, "entityId", "userId", metadata, "createdAt")
-         VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, NOW())`,
+        SQL.AUDIT_INSERT,
         [action, entity, entityId || null, userId || null, metadata ? JSON.stringify(metadata) : null]
       );
     } catch (err) {
@@ -45,14 +45,14 @@ export class AuthService {
   private async handleSingleSessionPolicy(userId: string) {
     try {
       const eventSettings = await queryOne<{ singleSession: boolean }>(
-        `SELECT "singleSession" FROM event_settings LIMIT 1`
+        `${SQL.EVENT_SETTINGS_SELECT} LIMIT 1`
       );
       const isSingleSessionEnabled = eventSettings ? eventSettings.singleSession : true;
 
       if (isSingleSessionEnabled) {
         await query(
-          `UPDATE sessions SET "revokedAt" = NOW()
-           WHERE "userId" = $1 AND "revokedAt" IS NULL AND "expiresAt" > NOW()`,
+          `UPDATE sessions SET "isRevoked" = true, "revokedAt" = NOW()
+           WHERE "userId" = $1 AND "isRevoked" = false AND "expiresAt" > NOW()`,
           [userId]
         );
       }
@@ -73,12 +73,16 @@ export class AuthService {
     }
 
     // Find student and associated user
-    const row = await queryOne<DbStudent & { user_id: string; user_username: string; user_passwordHash: string; user_role: UserRole; user_isActive: boolean }>(
-      `SELECT s.*, u.id as user_id, u.username as user_username, u."passwordHash" as "user_passwordHash",
-              u.role as user_role, u."isActive" as "user_isActive"
+    const row = await queryOne<DbStudent & { user_id: string; user_passwordHash: string; user_role: UserRole; user_isActive: boolean }>(
+      `SELECT s.id, s."userId", u."studentId", s."fullName",
+              b.code AS "batchNumber", s."batchId", s.status,
+              s."createdAt", s."updatedAt",
+              u."passwordHash" as "user_passwordHash", u.role as user_role,
+              u."isActive" as "user_isActive", u.id as user_id
        FROM students s
        JOIN users u ON u.id = s."userId"
-       WHERE s."studentId" = $1`,
+       LEFT JOIN batches b ON b.id = s."batchId"
+       WHERE u."studentId" = $1`,
       [studentId]
     );
 
@@ -107,9 +111,9 @@ export class AuthService {
     const expiresAt = new Date(Date.now() + SESSION_EXPIRATION_HOURS * 60 * 60 * 1000);
 
     const session = await queryOne<DbSession>(
-      `INSERT INTO sessions (id, "userId", "sessionToken", "createdAt", "expiresAt", "lastSeenAt")
-       VALUES (gen_random_uuid(), $1, $2, NOW(), $3, NOW())
-       RETURNING *`,
+      `INSERT INTO sessions (id, "userId", "tokenJti", "createdAt", "expiresAt", "updatedAt", "isRevoked")
+       VALUES (gen_random_uuid(), $1, $2, NOW(), $3, NOW(), false)
+       RETURNING id, "userId", "tokenJti" AS "sessionToken", "createdAt", "expiresAt", "revokedAt", "isRevoked", "updatedAt" AS "lastSeenAt"`,
       [row.userId, sessionToken, expiresAt]
     );
 
@@ -174,7 +178,7 @@ export class AuthService {
 
     // Check for admin record
     const admin = await queryOne<DbAdmin>(
-      `SELECT * FROM admins WHERE "userId" = $1`,
+      `${SQL.ADMIN_SELECT} WHERE "userId" = $1`,
       [user.id]
     );
 
@@ -186,9 +190,9 @@ export class AuthService {
     const expiresAt = new Date(Date.now() + SESSION_EXPIRATION_HOURS * 60 * 60 * 1000);
 
     const session = await queryOne<DbSession>(
-      `INSERT INTO sessions (id, "userId", "sessionToken", "createdAt", "expiresAt", "lastSeenAt")
-       VALUES (gen_random_uuid(), $1, $2, NOW(), $3, NOW())
-       RETURNING *`,
+      `INSERT INTO sessions (id, "userId", "tokenJti", "createdAt", "expiresAt", "updatedAt", "isRevoked")
+       VALUES (gen_random_uuid(), $1, $2, NOW(), $3, NOW(), false)
+       RETURNING id, "userId", "tokenJti" AS "sessionToken", "createdAt", "expiresAt", "revokedAt", "isRevoked", "updatedAt" AS "lastSeenAt"`,
       [user.id, sessionToken, expiresAt]
     );
 
@@ -217,9 +221,10 @@ export class AuthService {
   }
 
   /**
-   * Registers a new student account, generating sequential Student IDs (SARA-061+).
+   * Registers a new student account, generating sequential Student IDs (SARA-061+),
+   * then creates an authenticated session (auto-login).
    */
-  public async registerStudent(fullNameInput: string, batchNumberInput: string): Promise<{ studentId: string; fullName: string; batchNumber: string }> {
+  public async registerStudent(fullNameInput: string, batchNumberInput: string): Promise<AuthResult> {
     const fullName = (fullNameInput || '').trim();
     const batchNumber = (batchNumberInput || '').trim();
 
@@ -234,18 +239,18 @@ export class AuthService {
     }
 
     // Use transaction for atomic student registration
-    return await transaction(async (client) => {
+    const registration = await transaction(async (client) => {
       // 1. Ensure Batch exists (upsert)
       let batch = await txQueryOne<{ id: string; batchNumber: string }>(client,
-        `SELECT id, "batchNumber" FROM batches WHERE "batchNumber" = $1`,
+        `SELECT id, code AS "batchNumber" FROM batches WHERE code = $1`,
         [batchNumber]
       );
 
       if (!batch) {
         batch = await txQueryOne<{ id: string; batchNumber: string }>(client,
-          `INSERT INTO batches (id, "batchNumber", name, "createdAt", "updatedAt")
+          `INSERT INTO batches (id, code, name, "createdAt", "updatedAt")
            VALUES (gen_random_uuid(), $1, $2, NOW(), NOW())
-           RETURNING id, "batchNumber"`,
+           RETURNING id, code AS "batchNumber"`,
           [batchNumber, `Batch ${batchNumber}`]
         );
       }
@@ -256,7 +261,7 @@ export class AuthService {
 
       // 2. Determine next available Student ID (e.g. SARA-061)
       const existingStudents = await txQuery<{ studentId: string }>(client,
-        `SELECT "studentId" FROM students`
+        `SELECT u."studentId" FROM students s JOIN users u ON u.id = s."userId" WHERE u."studentId" IS NOT NULL`
       );
 
       let maxIndex = 0;
@@ -279,10 +284,10 @@ export class AuthService {
 
       // 4. Create User record
       const user = await txQueryOne<{ id: string }>(client,
-        `INSERT INTO users (id, username, email, "passwordHash", role, "isActive", "createdAt", "updatedAt")
-         VALUES (gen_random_uuid(), $1, $2, $3, $4, true, NOW(), NOW())
+        `INSERT INTO users (id, "studentId", "passwordHash", role, "isActive", "createdAt", "updatedAt")
+         VALUES (gen_random_uuid(), $1, $2, $3, true, NOW(), NOW())
          RETURNING id`,
-        [nextStudentId, `${nextStudentId.toLowerCase()}@sara.edu`, passwordHash, UserRole.STUDENT]
+        [nextStudentId, passwordHash, UserRole.STUDENT]
       );
 
       if (!user) {
@@ -291,10 +296,10 @@ export class AuthService {
 
       // 5. Create Student record
       const student = await txQueryOne<{ id: string; studentId: string; fullName: string; batchNumber: string }>(client,
-        `INSERT INTO students (id, "userId", "studentId", "fullName", "batchNumber", "batchId", status, "createdAt", "updatedAt")
-         VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, 'ACTIVE', NOW(), NOW())
-         RETURNING id, "studentId", "fullName", "batchNumber"`,
-        [user.id, nextStudentId, fullName, batchNumber, batch.id]
+        `INSERT INTO students (id, "userId", "fullName", "batchId", status, "createdAt", "updatedAt")
+         VALUES (gen_random_uuid(), $1, $2, $3, 'ACTIVE', NOW(), NOW())
+         RETURNING id, $4 AS "studentId", "fullName", $5 AS "batchNumber"`,
+        [user.id, fullName, batch.id, nextStudentId, batchNumber]
       );
 
       if (!student) {
@@ -303,17 +308,57 @@ export class AuthService {
 
       // 6. Audit log
       await txQueryOne(client,
-        `INSERT INTO audit_logs (id, action, entity, "entityId", "userId", metadata, "createdAt")
-         VALUES (gen_random_uuid(), 'STUDENT_REGISTER_SUCCESS', 'Student', $1, $2, $3, NOW())`,
-        [student.id, user.id, JSON.stringify({ studentId: nextStudentId, batchNumber })]
+        SQL.AUDIT_INSERT,
+        ['STUDENT_REGISTER_SUCCESS', 'Student', student.id, user.id, JSON.stringify({ studentId: nextStudentId, batchNumber })]
       );
 
       return {
+        userId: user.id,
         studentId: student.studentId,
         fullName: student.fullName,
         batchNumber: student.batchNumber,
+        studentRecordId: student.id,
       };
     });
+
+    await this.handleSingleSessionPolicy(registration.userId);
+
+    const sessionToken = crypto.randomUUID();
+    const expiresAt = new Date(Date.now() + SESSION_EXPIRATION_HOURS * 60 * 60 * 1000);
+
+    const session = await queryOne<DbSession>(
+      `INSERT INTO sessions (id, "userId", "tokenJti", "createdAt", "expiresAt", "updatedAt", "isRevoked")
+       VALUES (gen_random_uuid(), $1, $2, NOW(), $3, NOW(), false)
+       RETURNING id, "userId", "tokenJti" AS "sessionToken", "createdAt", "expiresAt", "revokedAt", "isRevoked", "updatedAt" AS "lastSeenAt"`,
+      [registration.userId, sessionToken, expiresAt]
+    );
+
+    if (!session) {
+      throw { statusCode: 500, message: 'Failed to create session' };
+    }
+
+    const token = signAuthToken({
+      userId: registration.userId,
+      role: UserRole.STUDENT,
+      sessionId: session.id,
+    });
+
+    await this.logAudit('STUDENT_REGISTER_AUTO_LOGIN', 'Student', registration.studentRecordId, registration.userId, {
+      studentId: registration.studentId,
+      batchNumber: registration.batchNumber,
+    });
+
+    return {
+      user: {
+        id: registration.userId,
+        studentId: registration.studentId,
+        name: registration.fullName,
+        batch: registration.batchNumber,
+        role: UserRole.STUDENT,
+      },
+      token,
+      sessionId: session.id,
+    };
   }
 
   /**
@@ -322,7 +367,7 @@ export class AuthService {
   public async logout(sessionId: string, userId?: string): Promise<void> {
     try {
       await query(
-        `UPDATE sessions SET "revokedAt" = NOW() WHERE id = $1`,
+        `UPDATE sessions SET "isRevoked" = true, "revokedAt" = NOW() WHERE id = $1`,
         [sessionId]
       );
       await this.logAudit('LOGOUT', 'Session', sessionId, userId);
@@ -353,7 +398,7 @@ export class AuthService {
     }
 
     const student = await queryOne<DbStudent>(
-      `SELECT * FROM students WHERE "userId" = $1`,
+      `${SQL.STUDENT_SELECT} WHERE s."userId" = $1`,
       [userId]
     );
 

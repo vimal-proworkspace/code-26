@@ -32,7 +32,7 @@ export const Round3CodeEditor: React.FC<Round3CodeEditorProps> = ({ roundId, isP
   const [showSubmitModal, setShowSubmitModal] = useState<boolean>(false);
   const [remainingSeconds, setRemainingSeconds] = useState<number>(0);
 
-  const saveTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const saveTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const loadWorkspace = async () => {
     try {

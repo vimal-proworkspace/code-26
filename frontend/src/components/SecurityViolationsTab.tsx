@@ -1,17 +1,14 @@
 import React, { useState, useEffect } from 'react';
-import { useSocket } from '../context/SocketContext';
 import { violationApi, AdminViolationOverviewResponse } from '../services/violationApi';
 
 export const SecurityViolationsTab: React.FC = () => {
-  const { isConnected } = useSocket();
   const [data, setData] = useState<AdminViolationOverviewResponse | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
-  const [error, setError] = useState<string | null>(null);
   const [filterStudentId, setFilterStudentId] = useState<string>('');
   const [filterType, setFilterType] = useState<string>('ALL');
 
   // Invigilator unlock state inside admin tab
-  const [unlockPassword, setUnlockPassword] = useState<string>('admin@sara');
+  const [unlockPassword] = useState<string>('admin@sara');
   const [unlockingId, setUnlockingId] = useState<string | null>(null);
 
   const fetchOverview = async () => {
@@ -19,9 +16,8 @@ export const SecurityViolationsTab: React.FC = () => {
       setLoading(true);
       const res = await violationApi.getAdminViolationOverview();
       setData(res);
-      setError(null);
     } catch (err: any) {
-      setError(err.message || 'Failed to fetch security violations overview');
+      console.error('Failed to fetch security violations overview:', err.message);
     } finally {
       setLoading(false);
     }

@@ -2,6 +2,7 @@ import { Request, Response, NextFunction } from 'express';
 import { UserRole, DbSession, DbUser, DbStudent } from '../config/types';
 import { verifyAuthToken, AUTH_COOKIE_NAME, AuthTokenPayload } from '../utils/jwt';
 import { queryOne, query } from '../config/database';
+import { SQL } from '../config/schemaSql';
 export { requireRole } from './role.middleware';
 
 export interface AuthenticatedUser {
@@ -48,17 +49,17 @@ export const requireAuth = async (
 
     // 3. Verify session in PostgreSQL database
     const dbSession = await queryOne<DbSession & { user_id: string; user_role: UserRole; user_username: string; user_isActive: boolean; student_studentId: string | null }>(
-      `SELECT s.*,
+      `SELECT s.id, s."userId", s."tokenJti" AS "sessionToken", s."createdAt", s."expiresAt",
+              s."revokedAt", s."isRevoked", s."updatedAt" AS "lastSeenAt",
               u.id as user_id, u.role as user_role, u.username as user_username, u."isActive" as "user_isActive",
-              st."studentId" as "student_studentId"
+              u."studentId" as "student_studentId"
        FROM sessions s
        JOIN users u ON u.id = s."userId"
-       LEFT JOIN students st ON st."userId" = u.id
        WHERE s.id = $1`,
       [payload.sessionId]
     );
 
-    if (!dbSession || dbSession.revokedAt || new Date(dbSession.expiresAt) < new Date()) {
+    if (!dbSession || dbSession.isRevoked || dbSession.revokedAt || new Date(dbSession.expiresAt) < new Date()) {
       res.status(401).json({ status: 'error', message: 'Session expired or revoked' });
       return;
     }
@@ -70,7 +71,7 @@ export const requireAuth = async (
 
     // 4. Update last seen timestamp asynchronously
     query(
-      `UPDATE sessions SET "lastSeenAt" = NOW() WHERE id = $1`,
+      `UPDATE sessions SET "updatedAt" = NOW() WHERE id = $1`,
       [dbSession.id]
     ).catch((err) => console.error('Failed to update session lastSeenAt:', err));
 

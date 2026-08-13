@@ -7,7 +7,6 @@ export const Register: React.FC = () => {
   const [batchNumber, setBatchNumber] = useState('284001');
   const [submitting, setSubmitting] = useState(false);
   const [localError, setLocalError] = useState('');
-  const [registeredStudent, setRegisteredStudent] = useState<{ studentId: string; fullName: string; batchNumber: string } | null>(null);
 
   const { registerStudent, clearError } = useAuth();
   const navigate = useNavigate();
@@ -33,54 +32,16 @@ export const Register: React.FC = () => {
 
     try {
       setSubmitting(true);
-      const res = await registerStudent(nameTrimmed, batchTrimmed);
-      setRegisteredStudent(res);
+      const user = await registerStudent(nameTrimmed, batchTrimmed);
+      if (user.role === 'STUDENT') {
+        navigate('/student/dashboard', { replace: true });
+      }
     } catch (err: any) {
       setLocalError(err.message || 'Registration failed');
     } finally {
       setSubmitting(false);
     }
   };
-
-  if (registeredStudent) {
-    return (
-      <div style={{ display: 'flex', minHeight: '100vh', alignItems: 'center', justifyContent: 'center', backgroundColor: '#0f172a', color: '#f8fafc', padding: '1rem' }}>
-        <div style={{ width: '100%', maxWidth: '440px', backgroundColor: '#1e293b', padding: '2.5rem', borderRadius: '1rem', boxShadow: '0 20px 25px -5px rgba(0, 0, 0, 0.5)', border: '1px solid #10b981', textAlign: 'center' }}>
-          <div style={{ width: '60px', height: '60px', borderRadius: '50%', backgroundColor: 'rgba(16, 185, 129, 0.2)', border: '2px solid #10b981', display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 1.5rem auto', fontSize: '1.75rem' }}>
-            ✓
-          </div>
-          <h2 style={{ fontSize: '1.5rem', fontWeight: 'bold', color: '#10b981', marginBottom: '0.5rem' }}>
-            Registration Successful!
-          </h2>
-          <p style={{ color: '#94a3b8', fontSize: '0.875rem', marginBottom: '1.5rem' }}>
-            Your student account has been created successfully.
-          </p>
-
-          <div style={{ backgroundColor: '#0f172a', padding: '1.25rem', borderRadius: '0.75rem', border: '1px solid #334155', textAlign: 'left', marginBottom: '2rem' }}>
-            <div style={{ marginBottom: '0.75rem' }}>
-              <span style={{ fontSize: '0.75rem', color: '#64748b', display: 'block', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Assigned Student ID</span>
-              <span style={{ fontSize: '1.5rem', fontWeight: 'bold', color: '#38bdf8' }}>{registeredStudent.studentId}</span>
-            </div>
-            <div style={{ marginBottom: '0.75rem' }}>
-              <span style={{ fontSize: '0.75rem', color: '#64748b', display: 'block', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Full Name</span>
-              <span style={{ fontSize: '1rem', color: '#f8fafc' }}>{registeredStudent.fullName}</span>
-            </div>
-            <div>
-              <span style={{ fontSize: '0.75rem', color: '#64748b', display: 'block', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Batch Number</span>
-              <span style={{ fontSize: '1rem', color: '#f8fafc' }}>{registeredStudent.batchNumber}</span>
-            </div>
-          </div>
-
-          <button
-            onClick={() => navigate('/login')}
-            style={{ width: '100%', padding: '0.875rem', backgroundColor: '#0284c7', color: '#ffffff', fontWeight: 600, borderRadius: '0.5rem', border: 'none', cursor: 'pointer', fontSize: '1rem' }}
-          >
-            GO TO LOGIN
-          </button>
-        </div>
-      </div>
-    );
-  }
 
   return (
     <div style={{ display: 'flex', minHeight: '100vh', alignItems: 'center', justifyContent: 'center', backgroundColor: '#0f172a', color: '#f8fafc', padding: '1rem' }}>

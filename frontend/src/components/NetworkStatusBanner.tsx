@@ -10,7 +10,9 @@ export const NetworkStatusBanner: React.FC = () => {
     if (!isConnected) {
       setWasDisconnected(true);
       setShowRestoredToast(false);
-    } else if (wasDisconnected && isConnected) {
+      return undefined;
+    }
+    if (wasDisconnected && isConnected) {
       setShowRestoredToast(true);
       const timer = setTimeout(() => {
         setShowRestoredToast(false);
@@ -18,6 +20,7 @@ export const NetworkStatusBanner: React.FC = () => {
       }, 3500);
       return () => clearTimeout(timer);
     }
+    return undefined;
   }, [isConnected, wasDisconnected]);
 
   if (!isConnected) {

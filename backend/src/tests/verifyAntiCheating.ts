@@ -1,44 +1,42 @@
-import { prisma } from '../config/database';
+import { query, queryOne, execute, closePool } from '../config/database';
 import { adminRoundService } from '../services/adminRound.service';
 import { violationService } from '../services/violation.service';
 import { round1Service } from '../services/round1.service';
-import { round2Service } from '../services/round2.service';
-import { round3Service } from '../services/round3.service';
-import { ViolationType, RoundStatus, RoundProgressStatus } from '@prisma/client';
+import { DbEvent, DbRound, DbStudent, DbRoundProgress } from '../config/types';
 
 async function runVerification() {
   console.log('=== STARTING ANTI-CHEATING & VIOLATION MANAGEMENT VERIFICATION ===\n');
 
   try {
     // Fetch Event & Round 1
-    const event = await prisma.event.findFirst();
+    const event = await queryOne<DbEvent>(`SELECT * FROM events ORDER BY "createdAt" ASC LIMIT 1`);
     if (!event) throw new Error('Primary Event not found. Run db seed first.');
 
-    const round1 = await prisma.round.findFirst({
-      where: { eventId: event.id, order: 1 },
-    });
+    const round1 = await queryOne<DbRound>(
+      `SELECT * FROM rounds WHERE "eventId" = $1 AND "order" = 1`,
+      [event.id]
+    );
     if (!round1) throw new Error('Round 1 not found.');
 
     // Fetch Student SARA-001
-    const student = await prisma.student.findFirst({
-      where: { studentId: 'SARA-001' },
-      include: { user: true },
-    });
+    const student = await queryOne<DbStudent>(
+      `SELECT * FROM students WHERE "studentId" = 'SARA-001'`
+    );
     if (!student || !student.userId) throw new Error('Test Student SARA-001 not found.');
 
     // Reset Round 1 state to READY and clear existing violations for clean test
-    await prisma.violation.deleteMany({ where: { studentId: student.id } });
-    await prisma.roundProgress.deleteMany({ where: { studentId: student.id } });
-    await prisma.round.update({
-      where: { id: round1.id },
-      data: { status: RoundStatus.READY, startTime: null, endTime: null },
-    });
+    await execute(`DELETE FROM violations WHERE "studentId" = $1`, [student.id]);
+    await execute(`DELETE FROM round_progress WHERE "studentId" = $1`, [student.id]);
+    await execute(
+      `UPDATE rounds SET status = 'READY', "startTime" = NULL, "endTime" = NULL WHERE id = $1`,
+      [round1.id]
+    );
 
     console.log('✓ Database state reset to READY for SARA-001 anti-cheating test.');
 
     // 1. Test Monitoring Scoping (Violation while READY is ignored)
     const readyRes = await violationService.recordViolation(student.userId, {
-      violationType: ViolationType.FULLSCREEN_EXIT,
+      violationType: 'FULLSCREEN_EXIT',
     });
     if (readyRes.counted) {
       throw new Error('SECURITY VIOLATION: Anti-cheating recorded a violation during READY round!');
@@ -47,13 +45,13 @@ async function runVerification() {
 
     // 2. Admin Starts Round 1 -> Status turns LIVE
     await adminRoundService.startRound(round1.id);
-    const liveRound = await prisma.round.findUnique({ where: { id: round1.id } });
-    if (liveRound?.status !== RoundStatus.LIVE) throw new Error('Round 1 failed to transition to LIVE!');
+    const liveRound = await queryOne<DbRound>(`SELECT * FROM rounds WHERE id = $1`, [round1.id]);
+    if (liveRound?.status !== 'LIVE') throw new Error('Round 1 failed to transition to LIVE!');
     console.log('✓ Admin started Round 1. Status = LIVE.');
 
     // 3. Record Valid Violation #1 during LIVE
     const v1 = await violationService.recordViolation(student.userId, {
-      violationType: ViolationType.FULLSCREEN_EXIT,
+      violationType: 'FULLSCREEN_EXIT',
       details: 'Test Fullscreen Exit 1',
     });
     if (!v1.counted || v1.violationCount !== 1 || v1.isLocked) {
@@ -63,7 +61,7 @@ async function runVerification() {
 
     // 4. Test 2-Second Deduplication (Immediate duplicate violation within < 2s is deduplicated)
     const dedupRes = await violationService.recordViolation(student.userId, {
-      violationType: ViolationType.FULLSCREEN_EXIT,
+      violationType: 'FULLSCREEN_EXIT',
       details: 'Duplicate Fullscreen Exit immediately after',
     });
     if (dedupRes.counted || dedupRes.violationCount !== 1) {
@@ -76,7 +74,7 @@ async function runVerification() {
 
     // 5. Record Violation #2
     const v2 = await violationService.recordViolation(student.userId, {
-      violationType: ViolationType.TAB_SWITCH,
+      violationType: 'TAB_SWITCH',
       details: 'Test Tab Switch 2',
     });
     if (!v2.counted || v2.violationCount !== 2 || v2.isLocked) {
@@ -88,17 +86,18 @@ async function runVerification() {
 
     // 6. Record Violation #3 (Reaching maximumViolations = 3) -> Triggers LOCK
     const v3 = await violationService.recordViolation(student.userId, {
-      violationType: ViolationType.WINDOW_BLUR,
+      violationType: 'WINDOW_BLUR',
       details: 'Test Window Blur 3',
     });
     if (!v3.counted || v3.violationCount !== 3 || !v3.isLocked) {
       throw new Error(`Violation 3 failed! Counted: ${v3.counted}, Count: ${v3.violationCount}, isLocked: ${v3.isLocked}`);
     }
 
-    const progress = await prisma.roundProgress.findUnique({
-      where: { studentId_roundId: { studentId: student.id, roundId: round1.id } },
-    });
-    if (progress?.status !== RoundProgressStatus.LOCKED) {
+    const progress = await queryOne<DbRoundProgress>(
+      `SELECT * FROM round_progress WHERE "studentId" = $1 AND "roundId" = $2`,
+      [student.id, round1.id]
+    );
+    if (progress?.status !== 'LOCKED') {
       throw new Error('RoundProgress failed to transition to LOCKED!');
     }
     console.log('✓ Violation #3 reached threshold (3/3). Student interface set to LOCKED!');
@@ -133,25 +132,28 @@ async function runVerification() {
     if (!wrongPasswordBlocked) throw new Error('SECURITY VIOLATION: Invalid invigilator password was accepted!');
 
     // 9. Correct Invigilator Continuation Unlock
-    const startDeadlineBefore = liveRound.endTime?.getTime();
+    const startDeadlineBefore = liveRound?.endTime ? new Date(liveRound.endTime).getTime() : 0;
     const unlockRes = await violationService.invigilatorUnlock(student.userId, 'admin@sara');
     if (!unlockRes.success) throw new Error('Valid invigilator unlock failed!');
 
-    const unlockedProgress = await prisma.roundProgress.findUnique({
-      where: { studentId_roundId: { studentId: student.id, roundId: round1.id } },
-    });
-    if (unlockedProgress?.status !== RoundProgressStatus.IN_PROGRESS) {
+    const unlockedProgress = await queryOne<DbRoundProgress>(
+      `SELECT * FROM round_progress WHERE "studentId" = $1 AND "roundId" = $2`,
+      [student.id, round1.id]
+    );
+    if (unlockedProgress?.status !== 'IN_PROGRESS') {
       throw new Error('RoundProgress failed to unlock to IN_PROGRESS!');
     }
 
-    const countAfterUnlock = await prisma.violation.count({
-      where: { studentId: student.id, roundId: round1.id },
-    });
-    if (countAfterUnlock !== 3) {
+    const countAfterUnlockRes = await queryOne<{ count: string }>(
+      `SELECT COUNT(*) FROM violations WHERE "studentId" = $1 AND "roundId" = $2`,
+      [student.id, round1.id]
+    );
+    if (parseInt(countAfterUnlockRes?.count || '0', 10) !== 3) {
       throw new Error('Unlocking student erroneously deleted recorded violations!');
     }
 
-    const startDeadlineAfter = (await prisma.round.findUnique({ where: { id: round1.id } }))?.endTime?.getTime();
+    const currentRoundState = await queryOne<DbRound>(`SELECT * FROM rounds WHERE id = $1`, [round1.id]);
+    const startDeadlineAfter = currentRoundState?.endTime ? new Date(currentRoundState.endTime).getTime() : 0;
     if (startDeadlineBefore !== startDeadlineAfter) {
       throw new Error('CRITICAL TIMER SAFETY VIOLATION: Invigilator unlock modified official competition deadline!');
     }
@@ -160,7 +162,7 @@ async function runVerification() {
     // 10. Test Admin Pause Safety
     await adminRoundService.pauseRound(round1.id);
     const pauseRes = await violationService.recordViolation(student.userId, {
-      violationType: ViolationType.FULLSCREEN_EXIT,
+      violationType: 'FULLSCREEN_EXIT',
     });
     if (pauseRes.counted) {
       throw new Error('SECURITY VIOLATION: Violation was recorded during PAUSED round!');
@@ -172,7 +174,7 @@ async function runVerification() {
     await adminRoundService.endRound(round1.id);
 
     const endedRes = await violationService.recordViolation(student.userId, {
-      violationType: ViolationType.TAB_SWITCH,
+      violationType: 'TAB_SWITCH',
     });
     if (endedRes.counted) {
       throw new Error('SECURITY VIOLATION: Violation recorded after round ENDED!');
@@ -191,7 +193,7 @@ async function runVerification() {
     console.error('❌ VERIFICATION FAILED:', err);
     process.exit(1);
   } finally {
-    await prisma.$disconnect();
+    await closePool();
   }
 }
 

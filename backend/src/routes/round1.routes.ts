@@ -1,14 +1,11 @@
 import { Router } from 'express';
-import { UserRole } from '@prisma/client';
+import { UserRole } from '../config/types';
 import { round1Controller } from '../controllers/round1.controller';
 import { requireAuth } from '../middleware/auth.middleware';
 import { requireRole } from '../middleware/role.middleware';
 
 const router = Router();
 
-// ==========================================
-// ADMIN ROUTES
-// ==========================================
 router.get(
   '/admin/questions/:roundId',
   requireAuth,
@@ -65,9 +62,6 @@ router.get(
   (req, res, next) => round1Controller.getRound1Scores(req, res, next)
 );
 
-// ==========================================
-// STUDENT ROUTES
-// ==========================================
 router.get(
   '/student/quiz/:roundId',
   requireAuth,

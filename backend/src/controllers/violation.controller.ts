@@ -1,7 +1,7 @@
 import { Response, NextFunction } from 'express';
 import { AuthenticatedRequest } from '../middleware/auth.middleware';
 import { violationService } from '../services/violation.service';
-import { ViolationType } from '@prisma/client';
+import { ViolationType } from '../config/types';
 
 export class ViolationController {
   public async recordViolation(req: AuthenticatedRequest, res: Response, next: NextFunction): Promise<void> {
@@ -13,7 +13,8 @@ export class ViolationController {
       }
 
       const { violationType, details } = req.body;
-      if (!violationType || !Object.values(ViolationType).includes(violationType)) {
+      const validTypes: ViolationType[] = ['FULLSCREEN_EXIT', 'TAB_SWITCH', 'WINDOW_BLUR', 'OTHER'];
+      if (!violationType || !validTypes.includes(violationType)) {
         res.status(400).json({ status: 'error', message: `Invalid violation type: ${violationType}` });
         return;
       }

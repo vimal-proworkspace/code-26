@@ -1,4 +1,4 @@
-import { ProgrammingLanguage, TestCaseVisibility } from '@prisma/client';
+import { ProgrammingLanguage, TestCaseVisibility } from '../../config/types';
 
 export type SubmissionStatus =
   | 'ACCEPTED'

@@ -1,11 +1,12 @@
+import crypto from 'crypto';
 import http from 'http';
 import { io as ioClient, Socket as ClientSocket } from 'socket.io-client';
-import { prisma } from '../config/database';
+import { queryOne, execute, closePool } from '../config/database';
 import { config } from '../config/env';
 import { createApp } from '../app';
 import { initSocketServer, broadcastRoundStarted, broadcastRoundPaused, broadcastRoundResumed, broadcastRoundEnded, broadcastRoundRestarted } from '../socket';
 import { createAuthToken } from '../utils/jwt';
-import { RoundStatus, RoundType, UserRole } from '@prisma/client';
+import { RoundStatus, RoundType, UserRole, DbUser, DbStudent, DbSession } from '../config/types';
 
 async function runVerification() {
   console.log('=== STARTING REAL-TIME SOCKET.IO VERIFICATION TEST ===\n');
@@ -25,36 +26,49 @@ async function runVerification() {
     console.log(`✓ Test Socket.IO server running on ${SERVER_URL}`);
 
     // 2. Fetch or create Admin and Student database records
-    let adminUser = await prisma.user.findFirst({ where: { role: UserRole.ADMIN } });
+    let adminUser = await queryOne<DbUser>(`SELECT * FROM users WHERE role = $1 LIMIT 1`, [UserRole.ADMIN]);
     if (!adminUser) {
-      adminUser = await prisma.user.create({
-        data: { username: 'admin@it.com', passwordHash: 'hash', role: UserRole.ADMIN },
-      });
+      adminUser = await queryOne<DbUser>(
+        `INSERT INTO users (id, username, "passwordHash", role, "isActive", "createdAt", "updatedAt")
+         VALUES (gen_random_uuid(), 'admin@it.com', 'hash', 'ADMIN', true, NOW(), NOW())
+         RETURNING *`
+      );
     }
 
-    let student = await prisma.student.findFirst({ where: { studentId: 'SARA-001' } });
+    let student = await queryOne<DbStudent>(`SELECT * FROM students WHERE "studentId" = 'SARA-001'`);
     if (!student) {
-      throw new Error('Student SARA-001 not found. Run db seed first.');
+      let user = await queryOne<DbUser>(
+        `INSERT INTO users (id, username, email, "passwordHash", role, "isActive", "createdAt", "updatedAt")
+         VALUES (gen_random_uuid(), 'sara-001', 'sara001@sara.edu', 'hash', 'STUDENT', true, NOW(), NOW())
+         RETURNING *`
+      );
+      student = await queryOne<DbStudent>(
+        `INSERT INTO students (id, "userId", "studentId", "fullName", "batchNumber", status, "createdAt", "updatedAt")
+         VALUES (gen_random_uuid(), $1, 'SARA-001', 'Test Student 1', '284001', 'ACTIVE', NOW(), NOW())
+         RETURNING *`,
+        [user!.id]
+      );
     }
 
-    let studentUser = await prisma.user.findFirst({ where: { studentId: student.id } });
-    if (!studentUser) {
-      studentUser = await prisma.user.create({
-        data: { username: 'sara001@test.com', passwordHash: 'hash', role: UserRole.STUDENT, studentId: student.id },
-      });
-    }
+    let studentUser = await queryOne<DbUser>(`SELECT * FROM users WHERE id = $1`, [student!.userId]);
 
     // Create database sessions for Auth
-    const adminSession = await prisma.session.create({
-      data: { userId: adminUser.id, expiresAt: new Date(Date.now() + 3600000) },
-    });
+    const adminSession = await queryOne<DbSession>(
+      `INSERT INTO sessions (id, "userId", "sessionToken", "createdAt", "expiresAt", "lastSeenAt")
+       VALUES (gen_random_uuid(), $1, $2, NOW(), NOW() + interval '1 hour', NOW())
+       RETURNING *`,
+      [adminUser!.id, crypto.randomUUID()]
+    );
 
-    const studentSession = await prisma.session.create({
-      data: { userId: studentUser.id, expiresAt: new Date(Date.now() + 3600000) },
-    });
+    const studentSession = await queryOne<DbSession>(
+      `INSERT INTO sessions (id, "userId", "sessionToken", "createdAt", "expiresAt", "lastSeenAt")
+       VALUES (gen_random_uuid(), $1, $2, NOW(), NOW() + interval '1 hour', NOW())
+       RETURNING *`,
+      [studentUser!.id, crypto.randomUUID()]
+    );
 
-    const adminToken = createAuthToken({ userId: adminUser.id, role: UserRole.ADMIN, sessionId: adminSession.id });
-    const studentToken = createAuthToken({ userId: studentUser.id, role: UserRole.STUDENT, sessionId: studentSession.id, studentId: student.studentId });
+    const adminToken = createAuthToken({ userId: adminUser!.id, role: UserRole.ADMIN, sessionId: adminSession!.id });
+    const studentToken = createAuthToken({ userId: studentUser!.id, role: UserRole.STUDENT, sessionId: studentSession!.id, studentId: student!.studentId });
 
     console.log('✓ Database sessions & JWT tokens generated for Admin and Student SARA-001.');
 
@@ -191,7 +205,7 @@ async function runVerification() {
     // Cleanup sockets and DB test sessions
     adminSocket.close();
     studentSocket.close();
-    await prisma.session.deleteMany({ where: { id: { in: [adminSession.id, studentSession.id] } } });
+    await execute(`DELETE FROM sessions WHERE id IN ($1, $2)`, [adminSession!.id, studentSession!.id]);
 
     console.log('\n=== REAL-TIME SOCKET.IO VERIFICATION SUCCESSFUL (ALL TESTS PASSED) ===');
   } catch (err: any) {
@@ -201,7 +215,7 @@ async function runVerification() {
     if (httpServer) {
       httpServer.close();
     }
-    await prisma.$disconnect();
+    await closePool();
   }
 }
 

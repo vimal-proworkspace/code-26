@@ -1,9 +1,9 @@
-import { prisma } from '../config/database';
+import { queryOne, closePool } from '../config/database';
 import { adminStudentService } from '../services/adminStudent.service';
 import { createApp } from '../app';
 import http from 'http';
 import request from 'supertest';
-import { UserRole } from '@prisma/client';
+import { UserRole, DbUser, DbStudent } from '../config/types';
 import jwt from 'jsonwebtoken';
 import { config } from '../config/env';
 
@@ -15,10 +15,11 @@ async function runVerification() {
   const app = createApp();
 
   // 1. Fetch test admin user and student user
-  const adminUser = await prisma.user.findFirst({ where: { role: UserRole.ADMIN } });
-  const studentUser = await prisma.user.findFirst({ where: { role: UserRole.STUDENT }, include: { student: true } });
+  const adminUser = await queryOne<DbUser>(`SELECT * FROM users WHERE role = $1 LIMIT 1`, [UserRole.ADMIN]);
+  const student = await queryOne<DbStudent>(`SELECT * FROM students LIMIT 1`);
+  const studentUser = student ? await queryOne<DbUser>(`SELECT * FROM users WHERE id = $1`, [student.userId]) : null;
 
-  if (!adminUser || !studentUser || !studentUser.student) {
+  if (!adminUser || !studentUser || !student) {
     throw new Error('Database is missing admin or seeded student users');
   }
 
@@ -30,7 +31,7 @@ async function runVerification() {
   );
 
   const studentToken = jwt.sign(
-    { userId: studentUser.id, role: studentUser.role, studentId: studentUser.student.studentId, username: studentUser.username },
+    { userId: studentUser.id, role: studentUser.role, studentId: student.studentId, username: studentUser.username },
     config.jwtSecret,
     { expiresIn: '1h' }
   );
@@ -59,16 +60,16 @@ async function runVerification() {
 
   // TEST 3: Search by Student ID
   const searchIdRes = await request(app)
-    .get(`/api/admin/students?search=${studentUser.student.studentId}`)
+    .get(`/api/admin/students?search=${student.studentId}`)
     .set('Cookie', [`token=${adminToken}`]);
 
   if (searchIdRes.status !== 200 || searchIdRes.body.data.students.length === 0) {
-    throw new Error(`Search by student ID failed for ${studentUser.student.studentId}`);
+    throw new Error(`Search by student ID failed for ${student.studentId}`);
   }
-  console.log(`✓ Test 3 Passed: Search by Student ID '${studentUser.student.studentId}' matched successfully.`);
+  console.log(`✓ Test 3 Passed: Search by Student ID '${student.studentId}' matched successfully.`);
 
   // TEST 4: Search by Name
-  const nameQuery = studentUser.student.fullName.slice(0, 4);
+  const nameQuery = student.fullName.slice(0, 4);
   const searchNameRes = await request(app)
     .get(`/api/admin/students?search=${nameQuery}`)
     .set('Cookie', [`token=${adminToken}`]);
@@ -80,13 +81,13 @@ async function runVerification() {
 
   // TEST 5: Filter by Batch Number
   const filterBatchRes = await request(app)
-    .get(`/api/admin/students?batchNumber=${studentUser.student.batchNumber}`)
+    .get(`/api/admin/students?batchNumber=${student.batchNumber}`)
     .set('Cookie', [`token=${adminToken}`]);
 
   if (filterBatchRes.status !== 200) {
     throw new Error(`Filter by batch failed`);
   }
-  console.log(`✓ Test 5 Passed: Filter by batch '${studentUser.student.batchNumber}' returned ${filterBatchRes.body.data.students.length} students.`);
+  console.log(`✓ Test 5 Passed: Filter by batch '${student.batchNumber}' returned ${filterBatchRes.body.data.students.length} students.`);
 
   // TEST 6: Filter by Status (OFFLINE)
   const filterOfflineRes = await request(app)
@@ -100,7 +101,7 @@ async function runVerification() {
 
   // TEST 7 & 8 & 9: Detailed Student Inspection & Security Check (No Password/Token Leak)
   const detailRes = await request(app)
-    .get(`/api/admin/students/${studentUser.student.studentId}`)
+    .get(`/api/admin/students/${student.studentId}`)
     .set('Cookie', [`token=${adminToken}`]);
 
   if (detailRes.status !== 200 || !detailRes.body.data.studentInfo) {
@@ -145,7 +146,7 @@ async function runVerification() {
 
   // TEST 27: Toggle Student Account Status (Enable/Disable)
   const suspendRes = await request(app)
-    .patch(`/api/admin/students/${studentUser.student.studentId}/status`)
+    .patch(`/api/admin/students/${student.studentId}/status`)
     .set('Cookie', [`token=${adminToken}`])
     .send({ isActive: false });
 
@@ -155,7 +156,7 @@ async function runVerification() {
 
   // Restore account
   await request(app)
-    .patch(`/api/admin/students/${studentUser.student.studentId}/status`)
+    .patch(`/api/admin/students/${student.studentId}/status`)
     .set('Cookie', [`token=${adminToken}`])
     .send({ isActive: true });
 

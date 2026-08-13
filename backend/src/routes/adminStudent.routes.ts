@@ -1,12 +1,11 @@
 import { Router } from 'express';
-import { UserRole } from '@prisma/client';
+import { UserRole } from '../config/types';
 import { adminStudentController } from '../controllers/adminStudent.controller';
 import { requireAuth } from '../middleware/auth.middleware';
 import { requireRole } from '../middleware/role.middleware';
 
 const router = Router();
 
-// Protect ALL admin student management routes with requireAuth & requireRole(ADMIN)
 router.use(requireAuth);
 router.use(requireRole(UserRole.ADMIN));
 

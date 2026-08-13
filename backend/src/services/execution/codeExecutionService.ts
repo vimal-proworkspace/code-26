@@ -1,4 +1,4 @@
-import { ProgrammingLanguage } from '@prisma/client';
+import { ProgrammingLanguage } from '../../config/types';
 import { BaseExecutor } from './baseExecutor';
 import { CExecutor } from './cExecutor';
 import { CppExecutor } from './cppExecutor';

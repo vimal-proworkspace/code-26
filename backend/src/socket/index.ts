@@ -1,8 +1,8 @@
 import { Server as HttpServer } from 'http';
 import { Server as SocketIOServer } from 'socket.io';
 import { config } from '../config/env';
-import { prisma } from '../config/database';
-import { UserRole, RoundStatus } from '@prisma/client';
+import { queryOne } from '../config/database';
+import { UserRole, DbRound, DbEvent } from '../config/types';
 import { socketAuthMiddleware, AuthenticatedSocket } from './socketAuth';
 import { ROOMS, RoomManager } from './roomManager';
 import { SocketServerEvents, SocketClientEvents, RoundStatePayload, AdminEventUpdatePayload } from './socketEvents';
@@ -58,7 +58,7 @@ export const initSocketServer = (httpServer: HttpServer): SocketIOServer => {
       onlineStudentsMap.get(user.studentId)!.add(socket.id);
 
       // Join current event room if available
-      const firstEvent = await prisma.event.findFirst();
+      const firstEvent = await queryOne<DbEvent>(`SELECT id FROM events ORDER BY "createdAt" ASC LIMIT 1`);
       if (firstEvent) {
         RoomManager.joinEventRoom(socket, firstEvent.id);
       }
@@ -116,16 +116,15 @@ export const initSocketServer = (httpServer: HttpServer): SocketIOServer => {
 
 export const sendRoundStateSync = async (socket: AuthenticatedSocket) => {
   try {
-    const liveRound = await prisma.round.findFirst({
-      where: { status: { in: [RoundStatus.LIVE, RoundStatus.PAUSED] } },
-      orderBy: { order: 'asc' },
-    });
+    const liveRound = await queryOne<DbRound>(
+      `SELECT * FROM rounds WHERE status IN ('LIVE', 'PAUSED') ORDER BY "order" ASC LIMIT 1`
+    );
 
     const now = Date.now();
     let payload: RoundStatePayload;
 
     if (liveRound) {
-      const endTimeMs = liveRound.endTime ? liveRound.endTime.getTime() : now;
+      const endTimeMs = liveRound.endTime ? new Date(liveRound.endTime).getTime() : now;
       const remainingSeconds = Math.max(0, Math.floor((endTimeMs - now) / 1000));
 
       payload = {
@@ -133,8 +132,8 @@ export const sendRoundStateSync = async (socket: AuthenticatedSocket) => {
         roundName: liveRound.name,
         roundType: liveRound.type,
         status: liveRound.status as any,
-        startTime: liveRound.startTime ? liveRound.startTime.toISOString() : null,
-        endTime: liveRound.endTime ? liveRound.endTime.toISOString() : null,
+        startTime: liveRound.startTime ? new Date(liveRound.startTime).toISOString() : null,
+        endTime: liveRound.endTime ? new Date(liveRound.endTime).toISOString() : null,
         serverTime: new Date().toISOString(),
         duration: liveRound.duration,
         remainingSeconds,
@@ -172,7 +171,7 @@ export const broadcastRoundStarted = (round: {
   if (!ioServer) return;
 
   const now = Date.now();
-  const endTimeMs = round.endTime ? round.endTime.getTime() : now;
+  const endTimeMs = round.endTime ? new Date(round.endTime).getTime() : now;
   const remainingSeconds = Math.max(0, Math.floor((endTimeMs - now) / 1000));
 
   const payload: RoundStatePayload = {
@@ -180,8 +179,8 @@ export const broadcastRoundStarted = (round: {
     roundName: round.name,
     roundType: round.type,
     status: 'LIVE',
-    startTime: round.startTime ? round.startTime.toISOString() : new Date().toISOString(),
-    endTime: round.endTime ? round.endTime.toISOString() : new Date().toISOString(),
+    startTime: round.startTime ? new Date(round.startTime).toISOString() : new Date().toISOString(),
+    endTime: round.endTime ? new Date(round.endTime).toISOString() : new Date().toISOString(),
     serverTime: new Date().toISOString(),
     duration: round.duration,
     remainingSeconds,
@@ -206,13 +205,13 @@ export const broadcastRoundResumed = (round: { id: string; endTime?: Date | null
   if (!ioServer) return;
 
   const now = Date.now();
-  const endTimeMs = round.endTime ? round.endTime.getTime() : now;
+  const endTimeMs = round.endTime ? new Date(round.endTime).getTime() : now;
   const remainingSeconds = Math.max(0, Math.floor((endTimeMs - now) / 1000));
 
   ioServer.emit(SocketServerEvents.ROUND_RESUMED, {
     roundId: round.id,
     status: 'LIVE',
-    endTime: round.endTime ? round.endTime.toISOString() : null,
+    endTime: round.endTime ? new Date(round.endTime).toISOString() : null,
     serverTime: new Date().toISOString(),
     remainingSeconds,
   });
@@ -276,20 +275,21 @@ export const broadcastAdminMetrics = async () => {
   if (!ioServer) return;
 
   try {
-    const totalStudents = await prisma.student.count();
+    const totalStudentsRes = await queryOne<{ count: string }>(`SELECT COUNT(*) FROM students`);
+    const totalStudents = parseInt(totalStudentsRes?.count || '0', 10);
     const onlineCount = onlineStudentsMap.size;
     const offlineCount = Math.max(0, totalStudents - onlineCount);
 
-    const activeRound = await prisma.round.findFirst({
-      where: { status: { in: [RoundStatus.LIVE, RoundStatus.PAUSED] } },
-    });
+    const activeRound = await queryOne<DbRound>(
+      `SELECT * FROM rounds WHERE status IN ('LIVE', 'PAUSED') LIMIT 1`
+    );
 
     const payload: AdminEventUpdatePayload = {
       totalStudents,
       onlineCount,
       offlineCount,
       activeRoundId: activeRound ? activeRound.id : null,
-      activeRoundStatus: activeRound ? activeRound.status : null,
+      activeRoundStatus: activeRound ? activeRound.status as any : null,
       serverTime: new Date().toISOString(),
     };
 

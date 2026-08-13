@@ -1,41 +1,38 @@
-import { prisma } from '../config/database';
+import { queryOne, execute, closePool } from '../config/database';
 import { round2Service } from '../services/round2.service';
-import { RoundStatus, RoundType } from '@prisma/client';
+import { RoundStatus, RoundType, DbEvent, DbRound, DbStudent } from '../config/types';
 
 async function runVerification() {
   console.log('=== STARTING ROUND 2 VERIFICATION TEST ===\n');
 
   try {
     // 1. Get or create test Event & Round 2
-    let event = await prisma.event.findFirst();
+    let event = await queryOne<DbEvent>(`SELECT * FROM events ORDER BY "createdAt" ASC LIMIT 1`);
     if (!event) {
-      event = await prisma.event.create({
-        data: { name: 'Verification Event 2026', status: 'READY' },
-      });
+      event = await queryOne<DbEvent>(
+        `INSERT INTO events (id, name, status, "createdAt", "updatedAt")
+         VALUES (gen_random_uuid(), 'Verification Event 2026', 'READY', NOW(), NOW())
+         RETURNING *`
+      );
     }
 
-    let round2 = await prisma.round.findFirst({ where: { type: RoundType.DEBUGGING } });
+    let round2 = await queryOne<DbRound>(`SELECT * FROM rounds WHERE type = $1 LIMIT 1`, [RoundType.DEBUGGING]);
     if (!round2) {
-      round2 = await prisma.round.create({
-        data: {
-          eventId: event.id,
-          name: 'Round 2 — Bug Hunt Test',
-          type: RoundType.DEBUGGING,
-          order: 2,
-          duration: 30,
-          maximumMarks: 10,
-          status: RoundStatus.LIVE,
-        },
-      });
+      round2 = await queryOne<DbRound>(
+        `INSERT INTO rounds (id, "eventId", name, type, "order", duration, "maximumMarks", status, "createdAt", "updatedAt")
+         VALUES (gen_random_uuid(), $1, 'Round 2 — Bug Hunt Test', $2, 2, 30, 10, 'LIVE', NOW(), NOW())
+         RETURNING *`,
+        [event!.id, RoundType.DEBUGGING]
+      );
     } else {
-      await prisma.round.update({
-        where: { id: round2.id },
-        data: { status: RoundStatus.LIVE, endTime: new Date(Date.now() + 3600 * 1000) },
-      });
+      round2 = await queryOne<DbRound>(
+        `UPDATE rounds SET status = 'LIVE', "endTime" = $1, "updatedAt" = NOW() WHERE id = $2 RETURNING *`,
+        [new Date(Date.now() + 3600 * 1000), round2!.id]
+      );
     }
 
     // 2. Get test Student (SARA-001)
-    const student = await prisma.student.findFirst({ where: { studentId: 'SARA-001' } });
+    const student = await queryOne<DbStudent>(`SELECT * FROM students WHERE "studentId" = 'SARA-001'`);
     if (!student) {
       throw new Error('Seeded student SARA-001 not found. Ensure database is seeded.');
     }
@@ -136,16 +133,16 @@ async function runVerification() {
     console.log('✓ Admin fetched historical submissions count:', adminSubs.length);
 
     // Clean up verification records safely
-    await prisma.bugAward.deleteMany({ where: { bugDefinition: { debuggingProblemId: problem.id } } });
-    await prisma.debuggingSubmission.deleteMany({ where: { debuggingProblemId: problem.id } });
-    await prisma.debuggingProblem.delete({ where: { id: problem.id } });
+    await execute(`DELETE FROM bug_awards WHERE "bugDefinitionId" IN (SELECT id FROM bug_definitions WHERE "debuggingProblemId" = $1)`, [problem.id]);
+    await execute(`DELETE FROM debugging_submissions WHERE "debuggingProblemId" = $1`, [problem.id]);
+    await execute(`DELETE FROM debugging_problems WHERE id = $1`, [problem.id]);
 
     console.log('\n=== ROUND 2 VERIFICATION SUCCESSFUL (ALL TESTS PASSED) ===');
   } catch (err: any) {
     console.error('❌ VERIFICATION FAILED:', err);
     process.exit(1);
   } finally {
-    await prisma.$disconnect();
+    await closePool();
   }
 }
 

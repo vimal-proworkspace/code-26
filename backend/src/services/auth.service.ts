@@ -1,7 +1,7 @@
 import bcrypt from 'bcrypt';
 import crypto from 'crypto';
-import { UserRole } from '@prisma/client';
-import { prisma } from '../config/database';
+import { query, queryOne, transaction, txQuery, txQueryOne, txExecute } from '../config/database';
+import { UserRole, DbUser, DbStudent, DbSession, DbAdmin } from '../config/types';
 import { signAuthToken } from '../utils/jwt';
 import { config } from '../config/env';
 
@@ -29,15 +29,11 @@ export class AuthService {
    */
   private async logAudit(action: string, entity: string, entityId?: string, userId?: string, metadata?: Record<string, unknown>) {
     try {
-      await prisma.auditLog.create({
-        data: {
-          action,
-          entity,
-          entityId,
-          userId,
-          metadata: metadata ? JSON.parse(JSON.stringify(metadata)) : undefined,
-        },
-      });
+      await query(
+        `INSERT INTO audit_logs (id, action, entity, "entityId", "userId", metadata, "createdAt")
+         VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, NOW())`,
+        [action, entity, entityId || null, userId || null, metadata ? JSON.stringify(metadata) : null]
+      );
     } catch (err) {
       console.error('Failed to create audit log entry:', err);
     }
@@ -48,21 +44,17 @@ export class AuthService {
    */
   private async handleSingleSessionPolicy(userId: string) {
     try {
-      const eventSettings = await prisma.eventSettings.findFirst();
+      const eventSettings = await queryOne<{ singleSession: boolean }>(
+        `SELECT "singleSession" FROM event_settings LIMIT 1`
+      );
       const isSingleSessionEnabled = eventSettings ? eventSettings.singleSession : true;
 
       if (isSingleSessionEnabled) {
-        // Revoke all existing active sessions for this user
-        await prisma.session.updateMany({
-          where: {
-            userId,
-            revokedAt: null,
-            expiresAt: { gt: new Date() },
-          },
-          data: {
-            revokedAt: new Date(),
-          },
-        });
+        await query(
+          `UPDATE sessions SET "revokedAt" = NOW()
+           WHERE "userId" = $1 AND "revokedAt" IS NULL AND "expiresAt" > NOW()`,
+          [userId]
+        );
       }
     } catch (err) {
       console.error('Error handling single session policy:', err);
@@ -81,60 +73,65 @@ export class AuthService {
     }
 
     // Find student and associated user
-    const student = await prisma.student.findUnique({
-      where: { studentId },
-      include: { user: true },
-    });
+    const row = await queryOne<DbStudent & { user_id: string; user_username: string; user_passwordHash: string; user_role: UserRole; user_isActive: boolean }>(
+      `SELECT s.*, u.id as user_id, u.username as user_username, u."passwordHash" as "user_passwordHash",
+              u.role as user_role, u."isActive" as "user_isActive"
+       FROM students s
+       JOIN users u ON u.id = s."userId"
+       WHERE s."studentId" = $1`,
+      [studentId]
+    );
 
-    if (!student || !student.user) {
+    if (!row) {
       await this.logAudit('STUDENT_LOGIN_FAILURE', 'Student', studentId, undefined, { reason: 'Student not found' });
       throw { statusCode: 401, message: 'Invalid credentials' };
     }
 
-    const user = student.user;
-
     // Verify bcrypt password
-    const isPasswordValid = await bcrypt.compare(password, user.passwordHash);
+    const isPasswordValid = await bcrypt.compare(password, row.user_passwordHash);
     if (!isPasswordValid) {
-      await this.logAudit('STUDENT_LOGIN_FAILURE', 'Student', student.id, user.id, { reason: 'Invalid password' });
+      await this.logAudit('STUDENT_LOGIN_FAILURE', 'Student', row.id, row.userId, { reason: 'Invalid password' });
       throw { statusCode: 401, message: 'Invalid credentials' };
     }
 
     // Verify active status
-    if (!user.isActive || student.status !== 'ACTIVE') {
+    if (!row.user_isActive || row.status !== 'ACTIVE') {
       throw { statusCode: 401, message: 'Account disabled' };
     }
 
     // Enforce single session policy
-    await this.handleSingleSessionPolicy(user.id);
+    await this.handleSingleSessionPolicy(row.userId);
 
     // Create session in PostgreSQL
     const sessionToken = crypto.randomUUID();
     const expiresAt = new Date(Date.now() + SESSION_EXPIRATION_HOURS * 60 * 60 * 1000);
 
-    const session = await prisma.session.create({
-      data: {
-        userId: user.id,
-        sessionToken,
-        expiresAt,
-      },
-    });
+    const session = await queryOne<DbSession>(
+      `INSERT INTO sessions (id, "userId", "sessionToken", "createdAt", "expiresAt", "lastSeenAt")
+       VALUES (gen_random_uuid(), $1, $2, NOW(), $3, NOW())
+       RETURNING *`,
+      [row.userId, sessionToken, expiresAt]
+    );
+
+    if (!session) {
+      throw { statusCode: 500, message: 'Failed to create session' };
+    }
 
     // Generate JWT
     const token = signAuthToken({
-      userId: user.id,
+      userId: row.userId,
       role: UserRole.STUDENT,
       sessionId: session.id,
     });
 
-    await this.logAudit('STUDENT_LOGIN_SUCCESS', 'Student', student.id, user.id);
+    await this.logAudit('STUDENT_LOGIN_SUCCESS', 'Student', row.id, row.userId);
 
     return {
       user: {
-        id: user.id,
-        studentId: student.studentId,
-        name: student.fullName,
-        batch: student.batchNumber,
+        id: row.userId,
+        studentId: row.studentId,
+        name: row.fullName,
+        batch: row.batchNumber,
         role: UserRole.STUDENT,
       },
       token,
@@ -154,10 +151,10 @@ export class AuthService {
     }
 
     // Find admin user
-    const user = await prisma.user.findUnique({
-      where: { username },
-      include: { admin: true },
-    });
+    const user = await queryOne<DbUser>(
+      `SELECT * FROM users WHERE username = $1`,
+      [username]
+    );
 
     if (!user || user.role !== UserRole.ADMIN) {
       await this.logAudit('ADMIN_LOGIN_FAILURE', 'User', username, undefined, { reason: 'Admin user not found' });
@@ -175,6 +172,12 @@ export class AuthService {
       throw { statusCode: 401, message: 'Account disabled' };
     }
 
+    // Check for admin record
+    const admin = await queryOne<DbAdmin>(
+      `SELECT * FROM admins WHERE "userId" = $1`,
+      [user.id]
+    );
+
     // Enforce single session policy
     await this.handleSingleSessionPolicy(user.id);
 
@@ -182,13 +185,16 @@ export class AuthService {
     const sessionToken = crypto.randomUUID();
     const expiresAt = new Date(Date.now() + SESSION_EXPIRATION_HOURS * 60 * 60 * 1000);
 
-    const session = await prisma.session.create({
-      data: {
-        userId: user.id,
-        sessionToken,
-        expiresAt,
-      },
-    });
+    const session = await queryOne<DbSession>(
+      `INSERT INTO sessions (id, "userId", "sessionToken", "createdAt", "expiresAt", "lastSeenAt")
+       VALUES (gen_random_uuid(), $1, $2, NOW(), $3, NOW())
+       RETURNING *`,
+      [user.id, sessionToken, expiresAt]
+    );
+
+    if (!session) {
+      throw { statusCode: 500, message: 'Failed to create session' };
+    }
 
     // Generate JWT
     const token = signAuthToken({
@@ -197,7 +203,7 @@ export class AuthService {
       sessionId: session.id,
     });
 
-    await this.logAudit('ADMIN_LOGIN_SUCCESS', 'Admin', user.admin?.id || user.id, user.id);
+    await this.logAudit('ADMIN_LOGIN_SUCCESS', 'Admin', admin?.id || user.id, user.id);
 
     return {
       user: {
@@ -221,28 +227,37 @@ export class AuthService {
       throw { statusCode: 400, message: 'Full name is required' };
     }
 
-    // Batch number validation: exactly 6 digits starting with 2840
-    const batchRegex = /^2840\d{2}$/;
+    // Batch number validation: exactly 6 numeric digits
+    const batchRegex = /^\d{6}$/;
     if (!batchRegex.test(batchNumber)) {
-      throw { statusCode: 400, message: 'Batch number must be exactly 6 digits starting with 2840 (e.g. 284001)' };
+      throw { statusCode: 400, message: 'Batch number must be exactly 6 numeric digits (e.g. 284001)' };
     }
 
     // Use transaction for atomic student registration
-    return await prisma.$transaction(async (tx) => {
-      // 1. Ensure Batch exists
-      const batch = await tx.batch.upsert({
-        where: { batchNumber },
-        update: {},
-        create: {
-          batchNumber,
-          name: `Batch ${batchNumber}`,
-        },
-      });
+    return await transaction(async (client) => {
+      // 1. Ensure Batch exists (upsert)
+      let batch = await txQueryOne<{ id: string; batchNumber: string }>(client,
+        `SELECT id, "batchNumber" FROM batches WHERE "batchNumber" = $1`,
+        [batchNumber]
+      );
+
+      if (!batch) {
+        batch = await txQueryOne<{ id: string; batchNumber: string }>(client,
+          `INSERT INTO batches (id, "batchNumber", name, "createdAt", "updatedAt")
+           VALUES (gen_random_uuid(), $1, $2, NOW(), NOW())
+           RETURNING id, "batchNumber"`,
+          [batchNumber, `Batch ${batchNumber}`]
+        );
+      }
+
+      if (!batch) {
+        throw { statusCode: 500, message: 'Failed to create batch' };
+      }
 
       // 2. Determine next available Student ID (e.g. SARA-061)
-      const existingStudents = await tx.student.findMany({
-        select: { studentId: true },
-      });
+      const existingStudents = await txQuery<{ studentId: string }>(client,
+        `SELECT "studentId" FROM students`
+      );
 
       let maxIndex = 0;
       for (const s of existingStudents) {
@@ -262,37 +277,36 @@ export class AuthService {
       const defaultPassword = config.defaultStudentPassword || 'welcome@sara';
       const passwordHash = await bcrypt.hash(defaultPassword, SALT_ROUNDS);
 
-      // 4. Create User & Student records
-      const user = await tx.user.create({
-        data: {
-          username: nextStudentId,
-          email: `${nextStudentId.toLowerCase()}@sara.edu`,
-          passwordHash,
-          role: UserRole.STUDENT,
-          isActive: true,
-        },
-      });
+      // 4. Create User record
+      const user = await txQueryOne<{ id: string }>(client,
+        `INSERT INTO users (id, username, email, "passwordHash", role, "isActive", "createdAt", "updatedAt")
+         VALUES (gen_random_uuid(), $1, $2, $3, $4, true, NOW(), NOW())
+         RETURNING id`,
+        [nextStudentId, `${nextStudentId.toLowerCase()}@sara.edu`, passwordHash, UserRole.STUDENT]
+      );
 
-      const student = await tx.student.create({
-        data: {
-          userId: user.id,
-          studentId: nextStudentId,
-          fullName,
-          batchNumber: batch.batchNumber,
-          batchId: batch.id,
-          status: 'ACTIVE',
-        },
-      });
+      if (!user) {
+        throw { statusCode: 500, message: 'Failed to create user' };
+      }
 
-      await tx.auditLog.create({
-        data: {
-          action: 'STUDENT_REGISTER_SUCCESS',
-          entity: 'Student',
-          entityId: student.id,
-          userId: user.id,
-          metadata: { studentId: nextStudentId, batchNumber },
-        },
-      });
+      // 5. Create Student record
+      const student = await txQueryOne<{ id: string; studentId: string; fullName: string; batchNumber: string }>(client,
+        `INSERT INTO students (id, "userId", "studentId", "fullName", "batchNumber", "batchId", status, "createdAt", "updatedAt")
+         VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, 'ACTIVE', NOW(), NOW())
+         RETURNING id, "studentId", "fullName", "batchNumber"`,
+        [user.id, nextStudentId, fullName, batchNumber, batch.id]
+      );
+
+      if (!student) {
+        throw { statusCode: 500, message: 'Failed to create student' };
+      }
+
+      // 6. Audit log
+      await txQueryOne(client,
+        `INSERT INTO audit_logs (id, action, entity, "entityId", "userId", metadata, "createdAt")
+         VALUES (gen_random_uuid(), 'STUDENT_REGISTER_SUCCESS', 'Student', $1, $2, $3, NOW())`,
+        [student.id, user.id, JSON.stringify({ studentId: nextStudentId, batchNumber })]
+      );
 
       return {
         studentId: student.studentId,
@@ -307,10 +321,10 @@ export class AuthService {
    */
   public async logout(sessionId: string, userId?: string): Promise<void> {
     try {
-      await prisma.session.update({
-        where: { id: sessionId },
-        data: { revokedAt: new Date() },
-      });
+      await query(
+        `UPDATE sessions SET "revokedAt" = NOW() WHERE id = $1`,
+        [sessionId]
+      );
       await this.logAudit('LOGOUT', 'Session', sessionId, userId);
     } catch (err) {
       console.error('Logout session revocation error:', err);
@@ -321,13 +335,10 @@ export class AuthService {
    * Retrieves sanitized profile information for current user.
    */
   public async getCurrentUser(userId: string): Promise<SafeUser> {
-    const user = await prisma.user.findUnique({
-      where: { id: userId },
-      include: {
-        student: true,
-        admin: true,
-      },
-    });
+    const user = await queryOne<DbUser>(
+      `SELECT * FROM users WHERE id = $1`,
+      [userId]
+    );
 
     if (!user) {
       throw { statusCode: 404, message: 'User not found' };
@@ -341,11 +352,16 @@ export class AuthService {
       };
     }
 
+    const student = await queryOne<DbStudent>(
+      `SELECT * FROM students WHERE "userId" = $1`,
+      [userId]
+    );
+
     return {
       id: user.id,
-      studentId: user.student?.studentId,
-      name: user.student?.fullName,
-      batch: user.student?.batchNumber,
+      studentId: student?.studentId,
+      name: student?.fullName,
+      batch: student?.batchNumber,
       role: UserRole.STUDENT,
     };
   }

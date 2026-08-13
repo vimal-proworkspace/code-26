@@ -1,25 +1,47 @@
+# ============================================
 # Node modules & dependencies
+# ============================================
+
 node_modules/
 .pnpm-store/
 
-# Build and dist directories
+
+# ============================================
+# Build & generated files
+# ============================================
+
 dist/
 build/
 out/
 .vite/
+coverage/
 
-# Environment files
+
+# ============================================
+# Environment & secrets
+# ============================================
+
 .env
-.env.local
-.env.development.local
-.env.test.local
-.env.production.local
+.env.*
+!.env.example
 
+
+# ============================================
 # Database & Prisma
-database/prisma/*.db
+# ============================================
+
+database/prisma/*.db*
 database/prisma/*.db-journal
 
+# Prisma generated client
+node_modules/.prisma/
+node_modules/@prisma/client/
+
+
+# ============================================
 # Logs
+# ============================================
+
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
@@ -27,7 +49,27 @@ pnpm-debug.log*
 logs/
 *.log
 
-# Editor and OS files
+
+# ============================================
+# Temporary execution files
+# ============================================
+
+tmp/
+temp/
+
+
+# ============================================
+# Test artifacts
+# ============================================
+
+test-results/
+playwright-report/
+
+
+# ============================================
+# Editor & IDE
+# ============================================
+
 .vscode/
 .idea/
 *.suo
@@ -35,5 +77,19 @@ logs/
 *.njsproj
 *.sln
 *.sw?
+*.code-workspace
+
+
+# ============================================
+# Operating System
+# ============================================
+
 .DS_Store
 Thumbs.db
+
+
+# ============================================
+# Environment / local development
+# ============================================
+
+*.local

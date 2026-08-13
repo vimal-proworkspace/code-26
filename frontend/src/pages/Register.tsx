@@ -25,9 +25,9 @@ export const Register: React.FC = () => {
       return;
     }
 
-    const batchRegex = /^2840\d{2}$/;
+    const batchRegex = /^\d{6}$/;
     if (!batchRegex.test(batchTrimmed)) {
-      setLocalError('Batch number must be exactly 6 digits starting with 2840 (e.g. 284001)');
+      setLocalError('Batch number must be exactly 6 numeric digits (e.g. 284001)');
       return;
     }
 
@@ -115,13 +115,13 @@ export const Register: React.FC = () => {
 
           <div style={{ marginBottom: '1.75rem' }}>
             <label style={{ display: 'block', fontSize: '0.875rem', fontWeight: 500, color: '#cbd5e1', marginBottom: '0.5rem' }}>
-              Batch Number (Format: 2840XX)
+              Batch Number (6 Digits)
             </label>
             <input
               type="text"
               value={batchNumber}
               onChange={(e) => setBatchNumber(e.target.value)}
-              placeholder="e.g. 284001"
+              placeholder="e.g. 284001 or 123456"
               style={{ width: '100%', padding: '0.75rem 1rem', backgroundColor: '#0f172a', border: '1px solid #475569', borderRadius: '0.5rem', color: '#f8fafc', fontSize: '1rem', outline: 'none' }}
               disabled={submitting}
             />

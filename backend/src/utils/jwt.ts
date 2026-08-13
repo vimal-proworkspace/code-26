@@ -1,12 +1,13 @@
 import jwt from 'jsonwebtoken';
 import { Response } from 'express';
-import { UserRole } from '@prisma/client';
+import { UserRole } from '../config/types';
 import { config } from '../config/env';
 
 export interface AuthTokenPayload {
   userId: string;
   role: UserRole;
   sessionId: string;
+  studentId?: string;
 }
 
 export const AUTH_COOKIE_NAME = 'auth_token';
@@ -20,6 +21,8 @@ export const signAuthToken = (payload: AuthTokenPayload): string => {
     expiresIn: `${TOKEN_EXPIRATION_HOURS}h`,
   });
 };
+
+export const createAuthToken = signAuthToken;
 
 /**
  * Verifies and decodes a JWT using the server JWT_SECRET.

@@ -1,7 +1,7 @@
 import http from 'http';
 import { config } from './config/env';
 import { createApp } from './app';
-import { prisma } from './config/database';
+import { closePool } from './config/database';
 import { initSocketServer } from './socket';
 
 const app = createApp();
@@ -30,10 +30,10 @@ if (process.env.NODE_ENV !== 'test') {
       server.close(async () => {
         console.log('✓ HTTP & Socket.IO server closed.');
         try {
-          await prisma.$disconnect();
-          console.log('✓ Prisma database connection disconnected.');
+          await closePool();
+          console.log('✓ PostgreSQL database connection pool closed.');
         } catch (err) {
-          console.error('Error disconnecting database:', err);
+          console.error('Error closing database pool:', err);
         }
         process.exit(0);
       });

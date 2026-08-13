@@ -1,5 +1,5 @@
-import { RoundType, RoundStatus, UserRole } from '@prisma/client';
-import { prisma } from '../config/database';
+import { RoundType, RoundStatus, DbRound, DbEvent } from '../config/types';
+import { query, queryOne, transaction, txQuery, txQueryOne, txExecute } from '../config/database';
 import {
   broadcastRoundStarted,
   broadcastRoundPaused,
@@ -36,15 +36,11 @@ export class AdminRoundService {
    */
   private async logAudit(action: string, roundId: string, userId?: string, metadata?: Record<string, unknown>) {
     try {
-      await prisma.auditLog.create({
-        data: {
-          action,
-          entity: 'Round',
-          entityId: roundId,
-          userId,
-          metadata: metadata ? JSON.parse(JSON.stringify(metadata)) : undefined,
-        },
-      });
+      await query(
+        `INSERT INTO audit_logs (id, action, entity, "entityId", "userId", metadata, "createdAt")
+         VALUES (gen_random_uuid(), $1, 'Round', $2, $3, $4, NOW())`,
+        [action, roundId, userId || null, metadata ? JSON.stringify(metadata) : null]
+      );
     } catch (err) {
       console.error('Failed to create admin audit log entry:', err);
     }
@@ -54,16 +50,16 @@ export class AdminRoundService {
    * Helper to retrieve primary event ID if not explicitly specified.
    */
   private async getPrimaryEventId(): Promise<string> {
-    const event = await prisma.event.findFirst();
+    const event = await queryOne<DbEvent>(
+      `SELECT * FROM events ORDER BY "createdAt" ASC LIMIT 1`
+    );
     if (!event) {
-      const newEvent = await prisma.event.create({
-        data: {
-          id: 'coding-challenge-2026-event-id',
-          name: 'Coding Challenge 2026',
-          status: 'DRAFT',
-        },
-      });
-      return newEvent.id;
+      const newEvent = await queryOne<DbEvent>(
+        `INSERT INTO events (id, name, status, "createdAt", "updatedAt")
+         VALUES ('coding-challenge-2026-event-id', 'Coding Challenge 2026', 'DRAFT', NOW(), NOW())
+         RETURNING *`
+      );
+      return newEvent!.id;
     }
     return event.id;
   }
@@ -73,33 +69,51 @@ export class AdminRoundService {
    */
   public async getRounds() {
     const eventId = await this.getPrimaryEventId();
-    const event = await prisma.event.findUnique({
-      where: { id: eventId },
-      include: {
-        settings: true,
-        visibility: true,
-      },
-    });
+    const event = await queryOne<DbEvent>(
+      `SELECT * FROM events WHERE id = $1`,
+      [eventId]
+    );
 
-    const rounds = await prisma.round.findMany({
-      where: { eventId },
-      orderBy: { order: 'asc' },
-      include: {
-        _count: {
-          select: {
-            questions: true,
-            debuggingProblems: true,
-            programmingProblems: true,
-            progresses: true,
-            scores: true,
+    const settings = await queryOne(
+      `SELECT * FROM event_settings WHERE "eventId" = $1`,
+      [eventId]
+    );
+
+    const visibility = await queryOne(
+      `SELECT * FROM visibility_settings WHERE "eventId" = $1`,
+      [eventId]
+    );
+
+    const rounds = await query<DbRound>(
+      `SELECT * FROM rounds WHERE "eventId" = $1 ORDER BY "order" ASC`,
+      [eventId]
+    );
+
+    // Compute counts for each round
+    const roundsWithCounts = await Promise.all(
+      rounds.map(async (r) => {
+        const questions = await queryOne<{ count: string }>(`SELECT COUNT(*) FROM questions WHERE "roundId" = $1`, [r.id]);
+        const debuggingProblems = await queryOne<{ count: string }>(`SELECT COUNT(*) FROM debugging_problems WHERE "roundId" = $1`, [r.id]);
+        const programmingProblems = await queryOne<{ count: string }>(`SELECT COUNT(*) FROM programming_problems WHERE "roundId" = $1`, [r.id]);
+        const progresses = await queryOne<{ count: string }>(`SELECT COUNT(*) FROM round_progress WHERE "roundId" = $1`, [r.id]);
+        const scores = await queryOne<{ count: string }>(`SELECT COUNT(*) FROM round_scores WHERE "roundId" = $1`, [r.id]);
+
+        return {
+          ...r,
+          _count: {
+            questions: parseInt(questions?.count || '0', 10),
+            debuggingProblems: parseInt(debuggingProblems?.count || '0', 10),
+            programmingProblems: parseInt(programmingProblems?.count || '0', 10),
+            progresses: parseInt(progresses?.count || '0', 10),
+            scores: parseInt(scores?.count || '0', 10),
           },
-        },
-      },
-    });
+        };
+      })
+    );
 
     return {
-      event,
-      rounds,
+      event: event ? { ...event, settings, visibility } : null,
+      rounds: roundsWithCounts,
     };
   }
 
@@ -107,26 +121,31 @@ export class AdminRoundService {
    * Retrieves a single round by ID.
    */
   public async getRoundById(id: string) {
-    const round = await prisma.round.findUnique({
-      where: { id },
-      include: {
-        questions: { orderBy: { order: 'asc' } },
-        debuggingProblems: true,
-        programmingProblems: true,
-        _count: {
-          select: {
-            progresses: true,
-            scores: true,
-          },
-        },
-      },
-    });
+    const round = await queryOne<DbRound>(
+      `SELECT * FROM rounds WHERE id = $1`,
+      [id]
+    );
 
     if (!round) {
       throw { statusCode: 404, message: 'Round not found' };
     }
 
-    return round;
+    const questions = await query(`SELECT * FROM questions WHERE "roundId" = $1 ORDER BY "order" ASC`, [id]);
+    const debuggingProblems = await query(`SELECT * FROM debugging_problems WHERE "roundId" = $1`, [id]);
+    const programmingProblems = await query(`SELECT * FROM programming_problems WHERE "roundId" = $1`, [id]);
+    const progressesCount = await queryOne<{ count: string }>(`SELECT COUNT(*) FROM round_progress WHERE "roundId" = $1`, [id]);
+    const scoresCount = await queryOne<{ count: string }>(`SELECT COUNT(*) FROM round_scores WHERE "roundId" = $1`, [id]);
+
+    return {
+      ...round,
+      questions,
+      debuggingProblems,
+      programmingProblems,
+      _count: {
+        progresses: parseInt(progressesCount?.count || '0', 10),
+        scores: parseInt(scoresCount?.count || '0', 10),
+      },
+    };
   }
 
   /**
@@ -149,29 +168,27 @@ export class AdminRoundService {
 
     const eventId = input.eventId || (await this.getPrimaryEventId());
 
-    // Determine next order if not specified
     let order = input.order;
     if (order === undefined || order === null) {
-      const highestRound = await prisma.round.findFirst({
-        where: { eventId },
-        orderBy: { order: 'desc' },
-      });
-      order = (highestRound?.order || 0) + 1;
+      const highestRound = await queryOne<{ max_order: number }>(
+        `SELECT MAX("order") as max_order FROM rounds WHERE "eventId" = $1`,
+        [eventId]
+      );
+      order = (highestRound?.max_order || 0) + 1;
     }
 
-    const round = await prisma.round.create({
-      data: {
-        eventId,
-        name,
-        type: input.type,
-        description: input.description,
-        duration: input.duration,
-        maximumMarks: input.maximumMarks,
-        order,
-        isEnabled: input.isEnabled !== undefined ? input.isEnabled : true,
-        status: RoundStatus.DRAFT,
-      },
-    });
+    const isEnabled = input.isEnabled !== undefined ? input.isEnabled : true;
+
+    const round = await queryOne<DbRound>(
+      `INSERT INTO rounds (id, "eventId", name, type, description, duration, "maximumMarks", "order", "isEnabled", status, "createdAt", "updatedAt")
+       VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, 'DRAFT', NOW(), NOW())
+       RETURNING *`,
+      [eventId, name, input.type, input.description || null, input.duration, input.maximumMarks, order, isEnabled]
+    );
+
+    if (!round) {
+      throw { statusCode: 500, message: 'Failed to create round' };
+    }
 
     await this.logAudit('ROUND_CREATED', round.id, userId, { name: round.name, type: round.type });
 
@@ -182,12 +199,12 @@ export class AdminRoundService {
    * Updates an existing round. Disallows dangerous edits while round is LIVE.
    */
   public async updateRound(id: string, input: UpdateRoundInput, userId?: string) {
-    const round = await prisma.round.findUnique({ where: { id } });
+    const round = await queryOne<DbRound>(`SELECT * FROM rounds WHERE id = $1`, [id]);
     if (!round) {
       throw { statusCode: 404, message: 'Round not found' };
     }
 
-    if (round.status === RoundStatus.LIVE) {
+    if (round.status === 'LIVE') {
       if (input.duration !== undefined && input.duration !== round.duration) {
         throw { statusCode: 400, message: 'Cannot modify duration while round is LIVE' };
       }
@@ -196,77 +213,74 @@ export class AdminRoundService {
       }
     }
 
-    const updatedRound = await prisma.round.update({
-      where: { id },
-      data: {
-        name: input.name !== undefined ? input.name.trim() : undefined,
-        type: input.type,
-        description: input.description,
-        duration: input.duration,
-        maximumMarks: input.maximumMarks,
-        order: input.order,
-        isEnabled: input.isEnabled,
-        status: input.status,
-      },
-    });
+    const name = input.name !== undefined ? input.name.trim() : round.name;
+    const type = input.type !== undefined ? input.type : round.type;
+    const description = input.description !== undefined ? input.description : round.description;
+    const duration = input.duration !== undefined ? input.duration : round.duration;
+    const maximumMarks = input.maximumMarks !== undefined ? input.maximumMarks : round.maximumMarks;
+    const order = input.order !== undefined ? input.order : round.order;
+    const isEnabled = input.isEnabled !== undefined ? input.isEnabled : round.isEnabled;
+    const status = input.status !== undefined ? input.status : round.status;
 
-    await this.logAudit('ROUND_UPDATED', updatedRound.id, userId, input as Record<string, unknown>);
+    const updatedRound = await queryOne<DbRound>(
+      `UPDATE rounds
+       SET name = $1, type = $2, description = $3, duration = $4, "maximumMarks" = $5,
+           "order" = $6, "isEnabled" = $7, status = $8, "updatedAt" = NOW()
+       WHERE id = $9
+       RETURNING *`,
+      [name, type, description, duration, maximumMarks, order, isEnabled, status, id]
+    );
+
+    await this.logAudit('ROUND_UPDATED', id, userId, input as Record<string, unknown>);
 
     return updatedRound;
   }
 
   /**
    * Deletes a round only if no student competition activity exists.
-   * Checks indirect relations: StudentAnswer via Question, DebuggingSubmission via DebuggingProblem,
-   * ProgrammingSubmission via ProgrammingProblem, plus direct progresses and scores.
    */
   public async deleteRound(id: string, userId?: string) {
-    const round = await prisma.round.findUnique({
-      where: { id },
-      include: {
-        _count: {
-          select: {
-            progresses: true,
-            scores: true,
-          },
-        },
-      },
-    });
-
+    const round = await queryOne<DbRound>(`SELECT * FROM rounds WHERE id = $1`, [id]);
     if (!round) {
       throw { statusCode: 404, message: 'Round not found' };
     }
 
-    // Check indirect activity: answers on questions belonging to this round
-    const answerCount = await prisma.studentAnswer.count({
-      where: { question: { roundId: id } },
-    });
+    const answerCount = await queryOne<{ count: string }>(
+      `SELECT COUNT(*) FROM student_answers sa JOIN questions q ON q.id = sa."questionId" WHERE q."roundId" = $1`,
+      [id]
+    );
+    const debugSubCount = await queryOne<{ count: string }>(
+      `SELECT COUNT(*) FROM debugging_submissions ds JOIN debugging_problems dp ON dp.id = ds."debuggingProblemId" WHERE dp."roundId" = $1`,
+      [id]
+    );
+    const progSubCount = await queryOne<{ count: string }>(
+      `SELECT COUNT(*) FROM programming_submissions ps JOIN programming_problems pp ON pp.id = ps."programmingProblemId" WHERE pp."roundId" = $1`,
+      [id]
+    );
+    const progressCount = await queryOne<{ count: string }>(
+      `SELECT COUNT(*) FROM round_progress WHERE "roundId" = $1`,
+      [id]
+    );
+    const scoreCount = await queryOne<{ count: string }>(
+      `SELECT COUNT(*) FROM round_scores WHERE "roundId" = $1`,
+      [id]
+    );
 
-    // Check indirect activity: debugging submissions on problems belonging to this round
-    const debugSubCount = await prisma.debuggingSubmission.count({
-      where: { problem: { roundId: id } },
-    });
+    const totalActivity =
+      parseInt(answerCount?.count || '0', 10) +
+      parseInt(debugSubCount?.count || '0', 10) +
+      parseInt(progSubCount?.count || '0', 10) +
+      parseInt(progressCount?.count || '0', 10) +
+      parseInt(scoreCount?.count || '0', 10);
 
-    // Check indirect activity: programming submissions on problems belonging to this round
-    const progSubCount = await prisma.programmingSubmission.count({
-      where: { problem: { roundId: id } },
-    });
-
-    const activityCount =
-      answerCount +
-      debugSubCount +
-      progSubCount +
-      round._count.progresses +
-      round._count.scores;
-
-    if (activityCount > 0) {
+    if (totalActivity > 0) {
       throw {
         statusCode: 400,
         message: 'Cannot delete round with existing student competition activity',
       };
     }
 
-    await prisma.round.delete({ where: { id } });
+    await query(`DELETE FROM rounds WHERE id = $1`, [id]);
     await this.logAudit('ROUND_DELETED', id, userId, { name: round.name });
 
     return { message: 'Round deleted successfully' };
@@ -280,13 +294,9 @@ export class AdminRoundService {
       throw { statusCode: 400, message: 'Ordered round IDs array is required' };
     }
 
-    await prisma.$transaction(async (tx) => {
+    await transaction(async (client) => {
       for (let i = 0; i < orderedRoundIds.length; i++) {
-        const id = orderedRoundIds[i];
-        await tx.round.update({
-          where: { id },
-          data: { order: i + 1 },
-        });
+        await txExecute(client, `UPDATE rounds SET "order" = $1, "updatedAt" = NOW() WHERE id = $2`, [i + 1, orderedRoundIds[i]]);
       }
     });
 
@@ -301,19 +311,19 @@ export class AdminRoundService {
    * Enables or disables a round. Cannot disable a LIVE or PAUSED round.
    */
   public async toggleRoundEnabled(id: string, isEnabled: boolean, userId?: string) {
-    const round = await prisma.round.findUnique({ where: { id } });
+    const round = await queryOne<DbRound>(`SELECT * FROM rounds WHERE id = $1`, [id]);
     if (!round) {
       throw { statusCode: 404, message: 'Round not found' };
     }
 
-    if (!isEnabled && (round.status === RoundStatus.LIVE || round.status === RoundStatus.PAUSED)) {
+    if (!isEnabled && (round.status === 'LIVE' || round.status === 'PAUSED')) {
       throw { statusCode: 400, message: 'Cannot disable a LIVE or PAUSED round' };
     }
 
-    const updatedRound = await prisma.round.update({
-      where: { id },
-      data: { isEnabled },
-    });
+    const updatedRound = await queryOne<DbRound>(
+      `UPDATE rounds SET "isEnabled" = $1, "updatedAt" = NOW() WHERE id = $2 RETURNING *`,
+      [isEnabled, id]
+    );
 
     await this.logAudit(isEnabled ? 'ROUND_ENABLED' : 'ROUND_DISABLED', id, userId);
 
@@ -322,11 +332,10 @@ export class AdminRoundService {
 
   /**
    * Starts a round (transitions status to LIVE using server clock).
-   * Enforces sequential progression (Round N requires Round N-1 to be ENDED).
    */
   public async startRound(id: string, userId?: string) {
-    const res = await prisma.$transaction(async (tx) => {
-      const round = await tx.round.findUnique({ where: { id } });
+    const res = await transaction(async (client) => {
+      const round = await txQueryOne<DbRound>(client, `SELECT * FROM rounds WHERE id = $1`, [id]);
       if (!round) {
         throw { statusCode: 404, message: 'Round not found' };
       }
@@ -335,22 +344,17 @@ export class AdminRoundService {
         throw { statusCode: 400, message: 'Cannot start a disabled round' };
       }
 
-      if (round.status === RoundStatus.LIVE) {
+      if (round.status === 'LIVE') {
         throw { statusCode: 400, message: 'Round is already LIVE' };
       }
 
-      // Sequential Progression Rule: Check previous ENABLED round in order
       if (round.order > 1) {
-        const previousEnabledRound = await tx.round.findFirst({
-          where: {
-            eventId: round.eventId,
-            order: { lt: round.order },
-            isEnabled: true,
-          },
-          orderBy: { order: 'desc' },
-        });
+        const previousEnabledRound = await txQueryOne<DbRound>(client,
+          `SELECT * FROM rounds WHERE "eventId" = $1 AND "order" < $2 AND "isEnabled" = true ORDER BY "order" DESC LIMIT 1`,
+          [round.eventId, round.order]
+        );
 
-        if (previousEnabledRound && previousEnabledRound.status !== RoundStatus.ENDED) {
+        if (previousEnabledRound && previousEnabledRound.status !== 'ENDED') {
           throw {
             statusCode: 400,
             message: `Previous enabled round (${previousEnabledRound.name}) must be ENDED before starting this round`,
@@ -361,33 +365,26 @@ export class AdminRoundService {
       const startTime = new Date();
       const endTime = new Date(startTime.getTime() + round.duration * 60 * 1000);
 
-      const updatedRound = await tx.round.update({
-        where: { id },
-        data: {
-          status: RoundStatus.LIVE,
-          startTime,
-          endTime,
-          remainingSeconds: null,
-        },
-      });
+      const updatedRound = await txQueryOne<DbRound>(client,
+        `UPDATE rounds
+         SET status = 'LIVE', "startTime" = $1, "endTime" = $2, "remainingSeconds" = NULL, "updatedAt" = NOW()
+         WHERE id = $3
+         RETURNING *`,
+        [startTime, endTime, id]
+      );
 
-      // Update parent event status to LIVE if draft/ready
-      await tx.event.update({
-        where: { id: round.eventId },
-        data: { status: 'LIVE' },
-      });
+      await txExecute(client,
+        `UPDATE events SET status = 'LIVE', "updatedAt" = NOW() WHERE id = $1`,
+        [round.eventId]
+      );
 
-      await tx.auditLog.create({
-        data: {
-          action: 'ROUND_STARTED',
-          entity: 'Round',
-          entityId: round.id,
-          userId,
-          metadata: { name: round.name, startTime, endTime },
-        },
-      });
+      await txExecute(client,
+        `INSERT INTO audit_logs (id, action, entity, "entityId", "userId", metadata, "createdAt")
+         VALUES (gen_random_uuid(), 'ROUND_STARTED', 'Round', $1, $2, $3, NOW())`,
+        [round.id, userId || null, JSON.stringify({ name: round.name, startTime, endTime })]
+      );
 
-      return updatedRound;
+      return updatedRound!;
     });
 
     broadcastRoundStarted(res);
@@ -398,38 +395,34 @@ export class AdminRoundService {
    * Pauses a LIVE round, storing remaining time in seconds.
    */
   public async pauseRound(id: string, userId?: string) {
-    const res = await prisma.$transaction(async (tx) => {
-      const round = await tx.round.findUnique({ where: { id } });
+    const res = await transaction(async (client) => {
+      const round = await txQueryOne<DbRound>(client, `SELECT * FROM rounds WHERE id = $1`, [id]);
       if (!round) {
         throw { statusCode: 404, message: 'Round not found' };
       }
 
-      if (round.status !== RoundStatus.LIVE) {
+      if (round.status !== 'LIVE') {
         throw { statusCode: 400, message: 'Only LIVE rounds can be paused' };
       }
 
-      const remainingMs = Math.max(0, (round.endTime?.getTime() || Date.now()) - Date.now());
+      const remainingMs = Math.max(0, (round.endTime ? new Date(round.endTime).getTime() : Date.now()) - Date.now());
       const remainingSeconds = Math.floor(remainingMs / 1000);
 
-      const updatedRound = await tx.round.update({
-        where: { id },
-        data: {
-          status: RoundStatus.PAUSED,
-          remainingSeconds,
-        },
-      });
+      const updatedRound = await txQueryOne<DbRound>(client,
+        `UPDATE rounds
+         SET status = 'PAUSED', "remainingSeconds" = $1, "updatedAt" = NOW()
+         WHERE id = $2
+         RETURNING *`,
+        [remainingSeconds, id]
+      );
 
-      await tx.auditLog.create({
-        data: {
-          action: 'ROUND_PAUSED',
-          entity: 'Round',
-          entityId: round.id,
-          userId,
-          metadata: { name: round.name, remainingSeconds },
-        },
-      });
+      await txExecute(client,
+        `INSERT INTO audit_logs (id, action, entity, "entityId", "userId", metadata, "createdAt")
+         VALUES (gen_random_uuid(), 'ROUND_PAUSED', 'Round', $1, $2, $3, NOW())`,
+        [round.id, userId || null, JSON.stringify({ name: round.name, remainingSeconds })]
+      );
 
-      return updatedRound;
+      return updatedRound!;
     });
 
     broadcastRoundPaused(res.id);
@@ -440,13 +433,13 @@ export class AdminRoundService {
    * Resumes a PAUSED round, calculating new deadline from remaining time.
    */
   public async resumeRound(id: string, userId?: string) {
-    const res = await prisma.$transaction(async (tx) => {
-      const round = await tx.round.findUnique({ where: { id } });
+    const res = await transaction(async (client) => {
+      const round = await txQueryOne<DbRound>(client, `SELECT * FROM rounds WHERE id = $1`, [id]);
       if (!round) {
         throw { statusCode: 404, message: 'Round not found' };
       }
 
-      if (round.status !== RoundStatus.PAUSED) {
+      if (round.status !== 'PAUSED') {
         throw { statusCode: 400, message: 'Only PAUSED rounds can be resumed' };
       }
 
@@ -456,27 +449,21 @@ export class AdminRoundService {
         : round.duration * 60;
       const endTime = new Date(startTime.getTime() + durationSeconds * 1000);
 
-      const updatedRound = await tx.round.update({
-        where: { id },
-        data: {
-          status: RoundStatus.LIVE,
-          startTime,
-          endTime,
-          remainingSeconds: null,
-        },
-      });
+      const updatedRound = await txQueryOne<DbRound>(client,
+        `UPDATE rounds
+         SET status = 'LIVE', "startTime" = $1, "endTime" = $2, "remainingSeconds" = NULL, "updatedAt" = NOW()
+         WHERE id = $3
+         RETURNING *`,
+        [startTime, endTime, id]
+      );
 
-      await tx.auditLog.create({
-        data: {
-          action: 'ROUND_RESUMED',
-          entity: 'Round',
-          entityId: round.id,
-          userId,
-          metadata: { name: round.name, newEndTime: endTime },
-        },
-      });
+      await txExecute(client,
+        `INSERT INTO audit_logs (id, action, entity, "entityId", "userId", metadata, "createdAt")
+         VALUES (gen_random_uuid(), 'ROUND_RESUMED', 'Round', $1, $2, $3, NOW())`,
+        [round.id, userId || null, JSON.stringify({ name: round.name, newEndTime: endTime })]
+      );
 
-      return updatedRound;
+      return updatedRound!;
     });
 
     broadcastRoundResumed(res);
@@ -487,54 +474,38 @@ export class AdminRoundService {
    * Ends a LIVE or PAUSED round.
    */
   public async endRound(id: string, userId?: string) {
-    const res = await prisma.$transaction(async (tx) => {
-      const round = await tx.round.findUnique({ where: { id } });
+    const res = await transaction(async (client) => {
+      const round = await txQueryOne<DbRound>(client, `SELECT * FROM rounds WHERE id = $1`, [id]);
       if (!round) {
         throw { statusCode: 404, message: 'Round not found' };
       }
 
-      if (round.status === RoundStatus.ENDED) {
+      if (round.status === 'ENDED') {
         throw { statusCode: 400, message: 'Round is already ENDED' };
       }
 
-      const updatedRound = await tx.round.update({
-        where: { id },
-        data: {
-          status: RoundStatus.ENDED,
-          endTime: new Date(),
-        },
-      });
+      const updatedRound = await txQueryOne<DbRound>(client,
+        `UPDATE rounds SET status = 'ENDED', "endTime" = NOW(), "updatedAt" = NOW() WHERE id = $1 RETURNING *`,
+        [id]
+      );
 
-      // Check if all enabled rounds in the event are ENDED
-      const unendedRoundsCount = await tx.round.count({
-        where: {
-          eventId: round.eventId,
-          isEnabled: true,
-          status: { not: RoundStatus.ENDED },
-        },
-      });
+      const unended = await txQueryOne<{ count: string }>(client,
+        `SELECT COUNT(*) FROM rounds WHERE "eventId" = $1 AND "isEnabled" = true AND status != 'ENDED'`,
+        [round.eventId]
+      );
 
-      if (unendedRoundsCount === 0) {
-        await tx.event.update({
-          where: { id: round.eventId },
-          data: { status: 'ENDED' },
-        });
+      const unendedCount = parseInt(unended?.count || '0', 10);
+      if (unendedCount === 0) {
+        await txExecute(client, `UPDATE events SET status = 'ENDED', "updatedAt" = NOW() WHERE id = $1`, [round.eventId]);
       }
 
-      await tx.auditLog.create({
-        data: {
-          action: 'ROUND_ENDED',
-          entity: 'Round',
-          entityId: round.id,
-          userId,
-          metadata: { name: round.name, eventCompleted: unendedRoundsCount === 0 },
-        },
-      });
+      await txExecute(client,
+        `INSERT INTO audit_logs (id, action, entity, "entityId", "userId", metadata, "createdAt")
+         VALUES (gen_random_uuid(), 'ROUND_ENDED', 'Round', $1, $2, $3, NOW())`,
+        [round.id, userId || null, JSON.stringify({ name: round.name, eventCompleted: unendedCount === 0 })]
+      );
 
-      return updatedRound;
-    });
-
-      return updatedRound;
+      return updatedRound!;
     });
 
     broadcastRoundEnded(res.id, res.name);
@@ -542,55 +513,39 @@ export class AdminRoundService {
   }
 
   /**
-   * Safely restarts a round, resetting its status to READY, clearing authoritative timing state,
+   * Safely restarts a round, resetting its status to READY, clearing timing state,
    * resetting active student progress for this round, and recording an audit log entry.
    */
   public async restartRound(id: string, reason?: string, userId?: string) {
-    const res = await prisma.$transaction(async (tx) => {
-      const round = await tx.round.findUnique({ where: { id } });
+    const res = await transaction(async (client) => {
+      const round = await txQueryOne<DbRound>(client, `SELECT * FROM rounds WHERE id = $1`, [id]);
       if (!round) {
         throw { statusCode: 404, message: 'Round not found' };
       }
 
-      if (round.status === RoundStatus.DRAFT) {
+      if (round.status === 'DRAFT') {
         throw { statusCode: 400, message: 'DRAFT rounds do not need to be restarted' };
       }
 
       const previousStatus = round.status;
 
-      // 1. Reset Round state and timing
-      const updatedRound = await tx.round.update({
-        where: { id },
-        data: {
-          status: RoundStatus.READY,
-          startTime: null,
-          endTime: null,
-          remainingSeconds: null,
-        },
-      });
+      const updatedRound = await txQueryOne<DbRound>(client,
+        `UPDATE rounds
+         SET status = 'READY', "startTime" = NULL, "endTime" = NULL, "remainingSeconds" = NULL, "updatedAt" = NOW()
+         WHERE id = $1
+         RETURNING *`,
+        [id]
+      );
 
-      // 2. Reset active student round progress for this specific round
-      await tx.roundProgress.deleteMany({
-        where: { roundId: id },
-      });
+      await txExecute(client, `DELETE FROM round_progress WHERE "roundId" = $1`, [id]);
 
-      // 3. Log audit event
-      await tx.auditLog.create({
-        data: {
-          action: 'ROUND_RESTARTED',
-          entity: 'Round',
-          entityId: round.id,
-          userId,
-          metadata: {
-            name: round.name,
-            previousStatus,
-            newStatus: RoundStatus.READY,
-            reason: reason ? reason.trim() : undefined,
-          },
-        },
-      });
+      await txExecute(client,
+        `INSERT INTO audit_logs (id, action, entity, "entityId", "userId", metadata, "createdAt")
+         VALUES (gen_random_uuid(), 'ROUND_RESTARTED', 'Round', $1, $2, $3, NOW())`,
+        [round.id, userId || null, JSON.stringify({ name: round.name, previousStatus, newStatus: 'READY', reason: reason ? reason.trim() : undefined })]
+      );
 
-      return updatedRound;
+      return updatedRound!;
     });
 
     broadcastRoundRestarted(res.id);
@@ -599,4 +554,3 @@ export class AdminRoundService {
 }
 
 export const adminRoundService = new AdminRoundService();
-

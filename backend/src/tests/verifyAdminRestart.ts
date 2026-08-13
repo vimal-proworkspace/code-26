@@ -1,12 +1,6 @@
-/**
- * Verification Test Script for Step 9: Safe Admin Round Restart / Reset
- *
- * Usage: npx ts-node src/tests/verifyAdminRestart.ts
- */
-
 import { adminRoundService } from '../services/adminRound.service';
-import { prisma } from '../config/database';
-import { RoundStatus } from '@prisma/client';
+import { query, queryOne, execute, closePool } from '../config/database';
+import { DbAuditLog } from '../config/types';
 
 interface TestResult {
   name: string;
@@ -46,60 +40,53 @@ async function main() {
     round1Id = r1!.id;
 
     // Reset status to DRAFT for clean testing
-    await prisma.round.update({
-      where: { id: round1Id },
-      data: { status: RoundStatus.DRAFT, remainingSeconds: null, startTime: null, endTime: null, isEnabled: true },
-    });
+    await execute(
+      `UPDATE rounds SET status = 'DRAFT', "remainingSeconds" = NULL, "startTime" = NULL, "endTime" = NULL, "isEnabled" = true WHERE id = $1`,
+      [round1Id]
+    );
   });
 
   // 1. Restart LIVE Round
   console.log('--- Restart LIVE Round Tests ---');
 
   let oldStartTimeMs = 0;
-  let oldEndTimeMs = 0;
 
   await runTest('Start Round 1 (LIVE)', async () => {
     const started = await adminRoundService.startRound(round1Id);
-    assert(started.status === RoundStatus.LIVE, `Expected LIVE status, got ${started.status}`);
+    assert(started.status === 'LIVE', `Expected LIVE status, got ${started.status}`);
     assert(!!started.startTime && !!started.endTime, 'Server timing must be set');
-    oldStartTimeMs = started.startTime!.getTime();
-    oldEndTimeMs = started.endTime!.getTime();
+    oldStartTimeMs = new Date(started.startTime!).getTime();
   });
 
   await runTest('Restart LIVE Round 1 (Clears timing & sets status to READY)', async () => {
     const restarted = await adminRoundService.restartRound(round1Id, 'Accidentally started round');
-    assert(restarted.status === RoundStatus.READY, `Expected status READY, got ${restarted.status}`);
+    assert(restarted.status === 'READY', `Expected status READY, got ${restarted.status}`);
     assert(restarted.startTime === null, 'startTime must be reset to null');
     assert(restarted.endTime === null, 'endTime must be reset to null');
     assert(restarted.remainingSeconds === null, 'remainingSeconds must be reset to null');
   });
 
   await runTest('Verify Audit Log for ROUND_RESTARTED', async () => {
-    const log = await prisma.auditLog.findFirst({
-      where: {
-        entity: 'Round',
-        entityId: round1Id,
-        action: 'ROUND_RESTARTED',
-      },
-      orderBy: { createdAt: 'desc' },
-    });
+    const log = await queryOne<DbAuditLog>(
+      `SELECT * FROM audit_logs WHERE entity = 'Round' AND "entityId" = $1 AND action = 'ROUND_RESTARTED' ORDER BY "createdAt" DESC LIMIT 1`,
+      [round1Id]
+    );
 
     assert(!!log, 'ROUND_RESTARTED audit log entry must exist');
-    const metadata = log!.metadata as any;
+    const metadata = typeof log!.metadata === 'string' ? JSON.parse(log!.metadata) : log!.metadata;
     assert(metadata.previousStatus === 'LIVE', `Expected previousStatus LIVE, got ${metadata.previousStatus}`);
     assert(metadata.newStatus === 'READY', `Expected newStatus READY, got ${metadata.newStatus}`);
     assert(metadata.reason === 'Accidentally started round', `Expected reason, got ${metadata.reason}`);
   });
 
   await runTest('Re-starting Round 1 generates NEW server timing', async () => {
-    // Wait brief moment to guarantee new timestamp
     await new Promise((res) => setTimeout(res, 100));
 
     const reStarted = await adminRoundService.startRound(round1Id);
-    assert(reStarted.status === RoundStatus.LIVE, `Expected status LIVE, got ${reStarted.status}`);
+    assert(reStarted.status === 'LIVE', `Expected status LIVE, got ${reStarted.status}`);
     assert(!!reStarted.startTime && !!reStarted.endTime, 'New server timing must be set');
 
-    const newStartMs = reStarted.startTime!.getTime();
+    const newStartMs = new Date(reStarted.startTime!).getTime();
     assert(newStartMs >= oldStartTimeMs, 'New start time must be equal or later than old start time');
   });
 
@@ -108,12 +95,12 @@ async function main() {
 
   await runTest('Pause Round 1', async () => {
     const paused = await adminRoundService.pauseRound(round1Id);
-    assert(paused.status === RoundStatus.PAUSED, `Expected PAUSED status, got ${paused.status}`);
+    assert(paused.status === 'PAUSED', `Expected PAUSED status, got ${paused.status}`);
   });
 
   await runTest('Restart PAUSED Round 1', async () => {
     const restarted = await adminRoundService.restartRound(round1Id, 'Restarting from pause');
-    assert(restarted.status === RoundStatus.READY, `Expected READY status, got ${restarted.status}`);
+    assert(restarted.status === 'READY', `Expected READY status, got ${restarted.status}`);
     assert(restarted.remainingSeconds === null, 'remainingSeconds must be cleared');
   });
 
@@ -121,7 +108,7 @@ async function main() {
   console.log('\n--- Edge Case Validation ---');
 
   await runTest('DRAFT Round restart rejected', async () => {
-    await prisma.round.update({ where: { id: round1Id }, data: { status: RoundStatus.DRAFT } });
+    await execute(`UPDATE rounds SET status = 'DRAFT' WHERE id = $1`, [round1Id]);
     try {
       await adminRoundService.restartRound(round1Id);
       throw new Error('Should have rejected restarting a DRAFT round');
@@ -131,10 +118,10 @@ async function main() {
   });
 
   // Reset database state to DRAFT
-  await prisma.round.update({
-    where: { id: round1Id },
-    data: { status: RoundStatus.DRAFT, remainingSeconds: null, startTime: null, endTime: null },
-  });
+  await execute(
+    `UPDATE rounds SET status = 'DRAFT', "remainingSeconds" = NULL, "startTime" = NULL, "endTime" = NULL WHERE id = $1`,
+    [round1Id]
+  );
 
   // ============ SUMMARY ============
   console.log('\n========================================');
@@ -155,7 +142,7 @@ async function main() {
   }
 
   console.log(`\nOverall: ${failed === 0 ? '✅ ALL PASSED' : '❌ SOME FAILED'}`);
-  await prisma.$disconnect();
+  await closePool();
   process.exit(failed > 0 ? 1 : 0);
 }
 

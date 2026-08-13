@@ -6,7 +6,8 @@
 
 import { authService } from '../services/auth.service';
 import { verifyAuthToken } from '../utils/jwt';
-import { prisma } from '../config/database';
+import { queryOne, closePool } from '../config/database';
+import { DbSession } from '../config/types';
 
 interface TestResult {
   name: string;
@@ -111,16 +112,13 @@ async function main() {
     assert(res.user.studentId === newStudentId, 'Should log in successfully with new ID');
   });
 
-  await runTest('Student Registration: Batch validation failure (184001)', async () => {
-    try {
-      await authService.registerStudent('Bad Batch Student', '184001');
-      throw new Error('Should have rejected invalid batch');
-    } catch (err: any) {
-      assert(err.statusCode === 400, `Expected status 400, got ${err.statusCode}`);
-    }
+  await runTest('Student Registration: Valid Custom 6-Digit Batch 123456', async () => {
+    const res = await authService.registerStudent('Verification Test Student 2', '123456');
+    assert(!!res.studentId, 'Student ID should be assigned');
+    assert(res.batchNumber === '123456', 'Batch number should match 123456');
   });
 
-  await runTest('Student Registration: Batch validation failure (2840)', async () => {
+  await runTest('Student Registration: Batch validation failure (short/non-digit)', async () => {
     try {
       await authService.registerStudent('Short Batch Student', '2840');
       throw new Error('Should have rejected invalid batch');
@@ -134,13 +132,13 @@ async function main() {
 
   await runTest('Single Session Enforcement', async () => {
     const login1 = await authService.studentLogin('SARA-002', 'welcome@sara');
-    const sess1Before = await prisma.session.findUnique({ where: { id: login1.sessionId } });
+    const sess1Before = await queryOne<DbSession>(`SELECT * FROM sessions WHERE id = $1`, [login1.sessionId]);
     assert(sess1Before?.revokedAt === null, 'Session 1 should be active initially');
 
     // Second login from another device/browser
     const login2 = await authService.studentLogin('SARA-002', 'welcome@sara');
-    const sess1After = await prisma.session.findUnique({ where: { id: login1.sessionId } });
-    const sess2After = await prisma.session.findUnique({ where: { id: login2.sessionId } });
+    const sess1After = await queryOne<DbSession>(`SELECT * FROM sessions WHERE id = $1`, [login1.sessionId]);
+    const sess2After = await queryOne<DbSession>(`SELECT * FROM sessions WHERE id = $1`, [login2.sessionId]);
 
     assert(sess1After?.revokedAt !== null, 'Session 1 should be revoked after second login');
     assert(sess2After?.revokedAt === null, 'Session 2 should be active');
@@ -153,7 +151,7 @@ async function main() {
     const login = await authService.studentLogin('SARA-003', 'welcome@sara');
     await authService.logout(login.sessionId, login.user.id);
 
-    const session = await prisma.session.findUnique({ where: { id: login.sessionId } });
+    const session = await queryOne<DbSession>(`SELECT * FROM sessions WHERE id = $1`, [login.sessionId]);
     assert(session?.revokedAt !== null, 'Session should be revoked after logout');
   });
 
@@ -176,7 +174,7 @@ async function main() {
   }
 
   console.log(`\nOverall: ${failed === 0 ? '✅ ALL PASSED' : '❌ SOME FAILED'}`);
-  await prisma.$disconnect();
+  await closePool();
   process.exit(failed > 0 ? 1 : 0);
 }
 

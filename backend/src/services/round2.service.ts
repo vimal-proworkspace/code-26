@@ -1,5 +1,5 @@
-import { RoundStatus, RoundProgressStatus, QuestionType, ProgrammingLanguage } from '@prisma/client';
-import { prisma } from '../config/database';
+import { RoundStatus, RoundProgressStatus, QuestionType, ProgrammingLanguage, DbDebuggingProblem, DbBugDefinition, DbBugAward, DbDebuggingSubmission, DbRoundProgress, DbRoundScore, DbRound } from '../config/types';
+import { query, queryOne, transaction, txQuery, txQueryOne, txExecute } from '../config/database';
 import { codeExecutionService } from './execution/codeExecutionService';
 import { TestCaseInput } from './execution/types';
 
@@ -55,20 +55,13 @@ export interface UpdateBugDefinitionInput {
 }
 
 export class Round2Service {
-  /**
-   * Helper audit logger
-   */
   private async logAudit(action: string, entityId: string, userId?: string, metadata?: Record<string, unknown>) {
     try {
-      await prisma.auditLog.create({
-        data: {
-          action,
-          entity: 'DebuggingProblem',
-          entityId,
-          userId,
-          metadata: metadata ? JSON.parse(JSON.stringify(metadata)) : undefined,
-        },
-      });
+      await query(
+        `INSERT INTO audit_logs (id, action, entity, "entityId", "userId", metadata, "createdAt")
+         VALUES (gen_random_uuid(), $1, 'DebuggingProblem', $2, $3, $4, NOW())`,
+        [action, entityId, userId || null, metadata ? JSON.stringify(metadata) : null]
+      );
     } catch (err) {
       console.error('Failed to log audit for Round 2:', err);
     }
@@ -79,14 +72,29 @@ export class Round2Service {
   // ==========================================
 
   public async getAdminProblems(roundId: string) {
-    return prisma.debuggingProblem.findMany({
-      where: { roundId },
-      orderBy: { createdAt: 'asc' },
-      include: {
-        bugDefinitions: { orderBy: { order: 'asc' } },
-        _count: { select: { submissions: true } },
-      },
-    });
+    const problems = await query<DbDebuggingProblem>(
+      `SELECT * FROM debugging_problems WHERE "roundId" = $1 ORDER BY "createdAt" ASC`,
+      [roundId]
+    );
+
+    return Promise.all(
+      problems.map(async (p) => {
+        const bugDefinitions = await query<DbBugDefinition>(
+          `SELECT * FROM bug_definitions WHERE "debuggingProblemId" = $1 ORDER BY "order" ASC`,
+          [p.id]
+        );
+        const subCount = await queryOne<{ count: string }>(
+          `SELECT COUNT(*) FROM debugging_submissions WHERE "debuggingProblemId" = $1`,
+          [p.id]
+        );
+
+        return {
+          ...p,
+          bugDefinitions,
+          _count: { submissions: parseInt(subCount?.count || '0', 10) },
+        };
+      })
+    );
   }
 
   public async createDebuggingProblem(roundId: string, input: CreateDebuggingProblemInput, userId?: string) {
@@ -98,57 +106,69 @@ export class Round2Service {
       throw { statusCode: 400, message: 'Title, description, and buggy C code are required' };
     }
 
-    const problem = await prisma.debuggingProblem.create({
-      data: {
+    const problem = await queryOne<DbDebuggingProblem>(
+      `INSERT INTO debugging_problems (id, "roundId", title, description, "buggyCode", "solutionCode", "starterCode", "maximumMarks", "timeLimit", "memoryLimit", "isActive", "createdAt", "updatedAt")
+       VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), NOW())
+       RETURNING *`,
+      [
         roundId,
         title,
         description,
         buggyCode,
-        solutionCode: input.solutionCode || null,
-        starterCode: input.starterCode || buggyCode,
-        maximumMarks: input.maximumMarks ?? 10,
-        timeLimit: input.timeLimit ?? 2000,
-        memoryLimit: input.memoryLimit ?? 128000,
-        isActive: input.isActive ?? true,
-      },
-    });
+        input.solutionCode || null,
+        input.starterCode || buggyCode,
+        input.maximumMarks ?? 10,
+        input.timeLimit ?? 2000,
+        input.memoryLimit ?? 128000,
+        input.isActive ?? true,
+      ]
+    );
+
+    if (!problem) {
+      throw { statusCode: 500, message: 'Failed to create debugging problem' };
+    }
 
     await this.logAudit('ROUND2_PROBLEM_CREATED', problem.id, userId, { title });
     return problem;
   }
 
   public async updateDebuggingProblem(problemId: string, input: UpdateDebuggingProblemInput, userId?: string) {
-    const existing = await prisma.debuggingProblem.findUnique({ where: { id: problemId } });
+    const existing = await queryOne<DbDebuggingProblem>(`SELECT * FROM debugging_problems WHERE id = $1`, [problemId]);
     if (!existing) {
       throw { statusCode: 404, message: 'Debugging problem not found' };
     }
 
-    const problem = await prisma.debuggingProblem.update({
-      where: { id: problemId },
-      data: {
-        title: input.title !== undefined ? input.title.trim() : existing.title,
-        description: input.description !== undefined ? input.description.trim() : existing.description,
-        buggyCode: input.buggyCode !== undefined ? input.buggyCode : existing.buggyCode,
-        solutionCode: input.solutionCode !== undefined ? input.solutionCode : existing.solutionCode,
-        starterCode: input.starterCode !== undefined ? input.starterCode : existing.starterCode,
-        maximumMarks: input.maximumMarks !== undefined ? input.maximumMarks : existing.maximumMarks,
-        timeLimit: input.timeLimit !== undefined ? input.timeLimit : existing.timeLimit,
-        memoryLimit: input.memoryLimit !== undefined ? input.memoryLimit : existing.memoryLimit,
-        isActive: input.isActive !== undefined ? input.isActive : existing.isActive,
-      },
-    });
+    const title = input.title !== undefined ? input.title.trim() : existing.title;
+    const description = input.description !== undefined ? input.description.trim() : existing.description;
+    const buggyCode = input.buggyCode !== undefined ? input.buggyCode : existing.buggyCode;
+    const solutionCode = input.solutionCode !== undefined ? input.solutionCode : existing.solutionCode;
+    const starterCode = input.starterCode !== undefined ? input.starterCode : existing.starterCode;
+    const maximumMarks = input.maximumMarks !== undefined ? input.maximumMarks : existing.maximumMarks;
+    const timeLimit = input.timeLimit !== undefined ? input.timeLimit : existing.timeLimit;
+    const memoryLimit = input.memoryLimit !== undefined ? input.memoryLimit : existing.memoryLimit;
+    const isActive = input.isActive !== undefined ? input.isActive : existing.isActive;
 
-    await this.logAudit('ROUND2_PROBLEM_UPDATED', problem.id, userId, { title: problem.title });
+    const problem = await queryOne<DbDebuggingProblem>(
+      `UPDATE debugging_problems
+       SET title = $1, description = $2, "buggyCode" = $3, "solutionCode" = $4,
+           "starterCode" = $5, "maximumMarks" = $6, "timeLimit" = $7, "memoryLimit" = $8,
+           "isActive" = $9, "updatedAt" = NOW()
+       WHERE id = $10
+       RETURNING *`,
+      [title, description, buggyCode, solutionCode, starterCode, maximumMarks, timeLimit, memoryLimit, isActive, problemId]
+    );
+
+    await this.logAudit('ROUND2_PROBLEM_UPDATED', problem!.id, userId, { title: problem!.title });
     return problem;
   }
 
   public async deleteDebuggingProblem(problemId: string, userId?: string) {
-    const existing = await prisma.debuggingProblem.findUnique({ where: { id: problemId } });
+    const existing = await queryOne<DbDebuggingProblem>(`SELECT * FROM debugging_problems WHERE id = $1`, [problemId]);
     if (!existing) {
       throw { statusCode: 404, message: 'Debugging problem not found' };
     }
 
-    await prisma.debuggingProblem.delete({ where: { id: problemId } });
+    await query(`DELETE FROM debugging_problems WHERE id = $1`, [problemId]);
     await this.logAudit('ROUND2_PROBLEM_DELETED', problemId, userId, { title: existing.title });
     return { status: 'success', message: 'Debugging problem deleted' };
   }
@@ -165,60 +185,74 @@ export class Round2Service {
       throw { statusCode: 400, message: 'Marks must be a non-negative number' };
     }
 
-    const problem = await prisma.debuggingProblem.findUnique({ where: { id: problemId } });
+    const problem = await queryOne<DbDebuggingProblem>(`SELECT * FROM debugging_problems WHERE id = $1`, [problemId]);
     if (!problem) {
       throw { statusCode: 404, message: 'Debugging problem not found' };
     }
 
-    const bugCount = await prisma.bugDefinition.count({ where: { debuggingProblemId: problemId } });
+    const bugCountRes = await queryOne<{ count: string }>(
+      `SELECT COUNT(*) FROM bug_definitions WHERE "debuggingProblemId" = $1`,
+      [problemId]
+    );
+    const bugCount = parseInt(bugCountRes?.count || '0', 10);
 
-    const bug = await prisma.bugDefinition.create({
-      data: {
-        debuggingProblemId: problemId,
+    const bug = await queryOne<DbBugDefinition>(
+      `INSERT INTO bug_definitions (id, "debuggingProblemId", "bugId", title, description, marks, "validationConfig", "order", "isActive")
+       VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8)
+       RETURNING *`,
+      [
+        problemId,
         bugId,
         title,
-        description: input.description || null,
-        marks: input.marks,
-        validationConfig: input.validationConfig ? JSON.parse(JSON.stringify(input.validationConfig)) : {},
-        order: input.order ?? bugCount + 1,
-        isActive: input.isActive ?? true,
-      },
-    });
+        input.description || null,
+        input.marks,
+        input.validationConfig ? JSON.stringify(input.validationConfig) : '{}',
+        input.order ?? bugCount + 1,
+        input.isActive ?? true,
+      ]
+    );
+
+    if (!bug) {
+      throw { statusCode: 500, message: 'Failed to create bug definition' };
+    }
 
     await this.logAudit('BUG_DEFINITION_CREATED', bug.id, userId, { bugId, problemId });
     return bug;
   }
 
   public async updateBugDefinition(bugDefinitionId: string, input: UpdateBugDefinitionInput, userId?: string) {
-    const existing = await prisma.bugDefinition.findUnique({ where: { id: bugDefinitionId } });
+    const existing = await queryOne<DbBugDefinition>(`SELECT * FROM bug_definitions WHERE id = $1`, [bugDefinitionId]);
     if (!existing) {
       throw { statusCode: 404, message: 'Bug definition not found' };
     }
 
-    const bug = await prisma.bugDefinition.update({
-      where: { id: bugDefinitionId },
-      data: {
-        bugId: input.bugId !== undefined ? input.bugId.trim() : existing.bugId,
-        title: input.title !== undefined ? input.title.trim() : existing.title,
-        description: input.description !== undefined ? input.description : existing.description,
-        marks: input.marks !== undefined ? input.marks : existing.marks,
-        validationConfig: input.validationConfig !== undefined ? input.validationConfig : existing.validationConfig,
-        order: input.order !== undefined ? input.order : existing.order,
-        isActive: input.isActive !== undefined ? input.isActive : existing.isActive,
-      },
-    });
+    const bugId = input.bugId !== undefined ? input.bugId.trim() : existing.bugId;
+    const title = input.title !== undefined ? input.title.trim() : existing.title;
+    const description = input.description !== undefined ? input.description : existing.description;
+    const marks = input.marks !== undefined ? input.marks : existing.marks;
+    const validationConfig = input.validationConfig !== undefined ? JSON.stringify(input.validationConfig) : existing.validationConfig;
+    const order = input.order !== undefined ? input.order : existing.order;
+    const isActive = input.isActive !== undefined ? input.isActive : existing.isActive;
 
-    await this.logAudit('BUG_DEFINITION_UPDATED', bug.id, userId, { bugId: bug.bugId });
+    const bug = await queryOne<DbBugDefinition>(
+      `UPDATE bug_definitions
+       SET "bugId" = $1, title = $2, description = $3, marks = $4, "validationConfig" = $5, "order" = $6, "isActive" = $7
+       WHERE id = $8
+       RETURNING *`,
+      [bugId, title, description, marks, validationConfig, order, isActive, bugDefinitionId]
+    );
+
+    await this.logAudit('BUG_DEFINITION_UPDATED', bug!.id, userId, { bugId: bug!.bugId });
     return bug;
   }
 
   public async deleteBugDefinition(bugDefinitionId: string, userId?: string) {
-    const existing = await prisma.bugDefinition.findUnique({ where: { id: bugDefinitionId } });
+    const existing = await queryOne<DbBugDefinition>(`SELECT * FROM bug_definitions WHERE id = $1`, [bugDefinitionId]);
     if (!existing) {
       throw { statusCode: 404, message: 'Bug definition not found' };
     }
 
-    await prisma.bugDefinition.delete({ where: { id: bugDefinitionId } });
+    await query(`DELETE FROM bug_definitions WHERE id = $1`, [bugDefinitionId]);
     await this.logAudit('BUG_DEFINITION_DELETED', bugDefinitionId, userId, { bugId: existing.bugId });
     return { status: 'success', message: 'Bug definition deleted' };
   }
@@ -227,43 +261,37 @@ export class Round2Service {
   // STUDENT WORKSPACE & EXECUTION
   // ==========================================
 
-  /**
-   * Retrieves active Round 2 Debugging Problem for student workspace.
-   * Strips all hidden validation configurations and solution code!
-   */
   public async getStudentRound2(roundId: string, studentId: string) {
-    const round = await prisma.round.findUnique({ where: { id: roundId } });
+    const round = await queryOne<DbRound>(`SELECT * FROM rounds WHERE id = $1`, [roundId]);
 
     if (!round) {
       throw { statusCode: 404, message: 'Round 2 not found' };
     }
 
-    if (round.status !== RoundStatus.LIVE) {
+    if (round.status !== 'LIVE') {
       throw { statusCode: 400, message: `Round 2 is currently ${round.status}. Accessible only when LIVE.` };
     }
 
-    // Check submission status
-    const progress = await prisma.roundProgress.findUnique({
-      where: { studentId_roundId: { studentId, roundId } },
-    });
+    const progress = await queryOne<DbRoundProgress>(
+      `SELECT * FROM round_progress WHERE "studentId" = $1 AND "roundId" = $2`,
+      [studentId, roundId]
+    );
 
-    const isSubmitted = progress?.status === RoundProgressStatus.SUBMITTED;
+    const isSubmitted = progress?.status === 'SUBMITTED';
 
-    const problem = await prisma.debuggingProblem.findFirst({
-      where: { roundId, isActive: true },
-      orderBy: { createdAt: 'asc' },
-    });
+    const problem = await queryOne<DbDebuggingProblem>(
+      `SELECT * FROM debugging_problems WHERE "roundId" = $1 AND "isActive" = true ORDER BY "createdAt" ASC LIMIT 1`,
+      [roundId]
+    );
 
     if (!problem) {
       throw { statusCode: 404, message: 'No active debugging problem found for Round 2' };
     }
 
-    // Calculate server remaining seconds
     const now = Date.now();
-    const endTimeMs = round.endTime ? round.endTime.getTime() : now;
+    const endTimeMs = round.endTime ? new Date(round.endTime).getTime() : now;
     const remainingSeconds = Math.max(0, Math.floor((endTimeMs - now) / 1000));
 
-    // Restore student saved code if any
     let savedCode = problem.buggyCode;
     if (progress?.stateData && typeof progress.stateData === 'object') {
       const data = progress.stateData as Record<string, any>;
@@ -272,7 +300,6 @@ export class Round2Service {
       }
     }
 
-    // SANITIZE: DO NOT return solutionCode, or bug definitions/marks/validationConfig!
     return {
       isSubmitted,
       submittedAt: progress?.submittedAt || null,
@@ -295,70 +322,58 @@ export class Round2Service {
     };
   }
 
-  /**
-   * Saves student code to RoundProgress.stateData
-   */
   public async saveStudentCode(roundId: string, studentId: string, code: string) {
-    const round = await prisma.round.findUnique({ where: { id: roundId } });
+    const round = await queryOne<DbRound>(`SELECT * FROM rounds WHERE id = $1`, [roundId]);
 
-    if (!round || round.status !== RoundStatus.LIVE) {
+    if (!round || round.status !== 'LIVE') {
       throw { statusCode: 400, message: 'Cannot save code: Round 2 is not LIVE' };
     }
 
-    if (round.endTime && new Date() > round.endTime) {
+    if (round.endTime && new Date() > new Date(round.endTime)) {
       throw { statusCode: 400, message: 'Round 2 deadline has passed' };
     }
 
-    const progress = await prisma.roundProgress.findUnique({
-      where: { studentId_roundId: { studentId, roundId } },
-    });
+    const progress = await queryOne<DbRoundProgress>(
+      `SELECT * FROM round_progress WHERE "studentId" = $1 AND "roundId" = $2`,
+      [studentId, roundId]
+    );
 
-    if (progress && progress.status === RoundProgressStatus.LOCKED) {
+    if (progress && progress.status === 'LOCKED') {
       throw { statusCode: 403, message: 'Competition interface is locked due to violation limit. Contact invigilator.' };
     }
 
-    if (progress && progress.status === RoundProgressStatus.SUBMITTED) {
+    if (progress && progress.status === 'SUBMITTED') {
       throw { statusCode: 400, message: 'Cannot modify code: Round 2 has been submitted' };
     }
 
-    const updatedProgress = await prisma.roundProgress.upsert({
-      where: { studentId_roundId: { studentId, roundId } },
-      create: {
-        studentId,
-        roundId,
-        status: RoundProgressStatus.IN_PROGRESS,
-        startedAt: new Date(),
-        lastSavedAt: new Date(),
-        stateData: { code },
-      },
-      update: {
-        status: RoundProgressStatus.IN_PROGRESS,
-        lastSavedAt: new Date(),
-        stateData: { code },
-      },
-    });
+    const updatedProgress = await queryOne<DbRoundProgress>(
+      `INSERT INTO round_progress (id, "studentId", "roundId", status, "startedAt", "lastSavedAt", "stateData")
+       VALUES (gen_random_uuid(), $1, $2, 'IN_PROGRESS', NOW(), NOW(), $3)
+       ON CONFLICT ("studentId", "roundId")
+       DO UPDATE SET status = 'IN_PROGRESS', "lastSavedAt" = NOW(), "stateData" = $3
+       RETURNING *`,
+      [studentId, roundId, JSON.stringify({ code })]
+    );
 
-    return { status: 'success', lastSavedAt: updatedProgress.lastSavedAt };
+    return { status: 'success', lastSavedAt: updatedProgress!.lastSavedAt };
   }
 
-  /**
-   * Runs C code against a sample test case without awarding marks or submitting.
-   */
   public async runStudentCode(roundId: string, studentId: string, problemId: string, code: string, inputStr: string = '') {
-    const round = await prisma.round.findUnique({ where: { id: roundId } });
+    const round = await queryOne<DbRound>(`SELECT * FROM rounds WHERE id = $1`, [roundId]);
 
-    if (!round || round.status !== RoundStatus.LIVE) {
+    if (!round || round.status !== 'LIVE') {
       throw { statusCode: 400, message: 'Cannot run code: Round 2 is not LIVE' };
     }
 
-    if (round.endTime && new Date() > round.endTime) {
+    if (round.endTime && new Date() > new Date(round.endTime)) {
       throw { statusCode: 400, message: 'Round 2 deadline has passed' };
     }
 
-    const progressRun = await prisma.roundProgress.findUnique({
-      where: { studentId_roundId: { studentId, roundId } },
-    });
-    if (progressRun && progressRun.status === RoundProgressStatus.LOCKED) {
+    const progressRun = await queryOne<DbRoundProgress>(
+      `SELECT * FROM round_progress WHERE "studentId" = $1 AND "roundId" = $2`,
+      [studentId, roundId]
+    );
+    if (progressRun && progressRun.status === 'LOCKED') {
       throw { statusCode: 403, message: 'Competition interface is locked due to violation limit. Contact invigilator.' };
     }
 
@@ -387,38 +402,39 @@ export class Round2Service {
     };
   }
 
-  /**
-   * Submits student code for Round 2, executes against deterministic bug validation criteria,
-   * awards un-awarded bug points, and records DebuggingSubmission and RoundScore safely in a transaction.
-   */
   public async submitStudentCode(roundId: string, studentId: string, problemId: string, code: string) {
-    const round = await prisma.round.findUnique({ where: { id: roundId } });
+    const round = await queryOne<DbRound>(`SELECT * FROM rounds WHERE id = $1`, [roundId]);
 
-    if (!round || round.status !== RoundStatus.LIVE) {
+    if (!round || round.status !== 'LIVE') {
       throw { statusCode: 400, message: 'Cannot submit code: Round 2 is not LIVE' };
     }
 
-    if (round.endTime && new Date() > round.endTime) {
+    if (round.endTime && new Date() > new Date(round.endTime)) {
       throw { statusCode: 400, message: 'Round 2 deadline has passed' };
     }
 
-    const progressSub = await prisma.roundProgress.findUnique({
-      where: { studentId_roundId: { studentId, roundId } },
-    });
-    if (progressSub && progressSub.status === RoundProgressStatus.LOCKED) {
+    const progressSub = await queryOne<DbRoundProgress>(
+      `SELECT * FROM round_progress WHERE "studentId" = $1 AND "roundId" = $2`,
+      [studentId, roundId]
+    );
+    if (progressSub && progressSub.status === 'LOCKED') {
       throw { statusCode: 403, message: 'Competition interface is locked due to violation limit. Contact invigilator.' };
     }
 
-    const problem = await prisma.debuggingProblem.findUnique({
-      where: { id: problemId },
-      include: { bugDefinitions: { where: { isActive: true }, orderBy: { order: 'asc' } } },
-    });
+    const problem = await queryOne<DbDebuggingProblem>(
+      `SELECT * FROM debugging_problems WHERE id = $1`,
+      [problemId]
+    );
 
     if (!problem) {
       throw { statusCode: 404, message: 'Debugging problem not found' };
     }
 
-    // 1. First, compile the C code
+    const bugDefinitions = await query<DbBugDefinition>(
+      `SELECT * FROM bug_definitions WHERE "debuggingProblemId" = $1 AND "isActive" = true ORDER BY "order" ASC`,
+      [problemId]
+    );
+
     const sampleTestCase: TestCaseInput = {
       id: 'compilation_check',
       input: '',
@@ -437,12 +453,11 @@ export class Round2Service {
     const compileStatus = compileCheck.compileStatus;
     const compileOutput = compileCheck.compileOutput || '';
 
-    // 2. Validate bugs deterministically
     const newlyFixedBugIds: string[] = [];
     let compilationFailed = compileStatus === 'COMPILATION_ERROR';
 
     if (!compilationFailed) {
-      for (const bugDef of problem.bugDefinitions) {
+      for (const bugDef of bugDefinitions) {
         const isFixed = await this.validateBug(code, bugDef.validationConfig);
         if (isFixed) {
           newlyFixedBugIds.push(bugDef.id);
@@ -450,114 +465,90 @@ export class Round2Service {
       }
     }
 
-    // 3. Process awards and save submission atomically inside prisma.$transaction
-    return await prisma.$transaction(async (tx) => {
-      // Find current submission count for this student
-      const subCount = await tx.debuggingSubmission.count({
-        where: { studentId, debuggingProblemId: problemId },
-      });
+    return await transaction(async (client) => {
+      const subCountRes = await txQueryOne<{ count: string }>(client,
+        `SELECT COUNT(*) FROM debugging_submissions WHERE "studentId" = $1 AND "debuggingProblemId" = $2`,
+        [studentId, problemId]
+      );
+      const subCount = parseInt(subCountRes?.count || '0', 10);
 
-      // Find existing bug awards for this student
-      const existingAwards = await tx.bugAward.findMany({
-        where: { studentId, bugDefinitionId: { in: problem.bugDefinitions.map((b) => b.id) } },
-      });
+      const existingAwards = await txQuery<DbBugAward>(client,
+        `SELECT * FROM bug_awards WHERE "studentId" = $1 AND "bugDefinitionId" = ANY($2)`,
+        [studentId, bugDefinitions.map((b) => b.id)]
+      );
 
       const awardedBugDefIds = new Set(existingAwards.map((a) => a.bugDefinitionId));
-
-      // Filter only bugs that have NOT been awarded yet
-      const bugsToAward = problem.bugDefinitions.filter((b) => newlyFixedBugIds.includes(b.id) && !awardedBugDefIds.has(b.id));
+      const bugsToAward = bugDefinitions.filter((b) => newlyFixedBugIds.includes(b.id) && !awardedBugDefIds.has(b.id));
 
       let newScorePoints = 0;
 
-      // Create DebuggingSubmission record
-      const submission = await tx.debuggingSubmission.create({
-        data: {
+      const submission = await txQueryOne<DbDebuggingSubmission>(client,
+        `INSERT INTO debugging_submissions (id, "studentId", "debuggingProblemId", "submittedCode", "submissionNumber", "compileStatus", "compileOutput", "executionOutput", "executionTime", score, "submittedAt")
+         VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, 0, NOW())
+         RETURNING *`,
+        [
           studentId,
-          debuggingProblemId: problemId,
-          submittedCode: code,
-          submissionNumber: subCount + 1,
-          compileStatus: compileStatus,
-          compileOutput: compileOutput,
-          executionOutput: compileCheck.testResults[0]?.actualOutput || '',
-          executionTime: compileCheck.totalExecutionTimeMs,
-          score: 0, // Will update below
-        },
-      });
+          problemId,
+          code,
+          subCount + 1,
+          compileStatus,
+          compileOutput,
+          compileCheck.testResults[0]?.actualOutput || '',
+          compileCheck.totalExecutionTimeMs,
+        ]
+      );
 
-      // Award newly fixed bugs safely
       for (const bug of bugsToAward) {
         try {
-          await tx.bugAward.create({
-            data: {
-              studentId,
-              bugDefinitionId: bug.id,
-              debuggingSubmissionId: submission.id,
-              marksAwarded: bug.marks,
-            },
-          });
+          await txExecute(client,
+            `INSERT INTO bug_awards (id, "studentId", "bugDefinitionId", "debuggingSubmissionId", "marksAwarded", "awardedAt")
+             VALUES (gen_random_uuid(), $1, $2, $3, $4, NOW())
+             ON CONFLICT ("studentId", "bugDefinitionId") DO NOTHING`,
+            [studentId, bug.id, submission!.id, bug.marks]
+          );
           newScorePoints += bug.marks;
         } catch (err: any) {
-          // Handle potential concurrency duplicate constraint gracefully
           console.warn(`Bug award concurrency skipped for bug ${bug.id}:`, err?.message);
         }
       }
 
-      // Calculate overall Round 2 score across all awarded bugs
-      const allStudentAwards = await tx.bugAward.findMany({
-        where: { studentId, bugDefinition: { debuggingProblemId: problemId } },
-      });
+      const allAwards = await txQuery<DbBugAward>(client,
+        `SELECT ba.* FROM bug_awards ba JOIN bug_definitions bd ON bd.id = ba."bugDefinitionId" WHERE ba."studentId" = $1 AND bd."debuggingProblemId" = $2`,
+        [studentId, problemId]
+      );
 
-      const totalScore = allStudentAwards.reduce((sum, a) => sum + a.marksAwarded, 0);
+      const totalScore = allAwards.reduce((sum, a) => sum + a.marksAwarded, 0);
 
-      // Update submission score
-      await tx.debuggingSubmission.update({
-        where: { id: submission.id },
-        data: { score: totalScore },
-      });
+      await txExecute(client,
+        `UPDATE debugging_submissions SET score = $1 WHERE id = $2`,
+        [totalScore, submission!.id]
+      );
 
-      // Upsert RoundScore for Round 2
-      await tx.roundScore.upsert({
-        where: { studentId_roundId: { studentId, roundId } },
-        create: {
-          studentId,
-          roundId,
-          score: totalScore,
-          maximumScore: problem.maximumMarks,
-          calculatedAt: new Date(),
-        },
-        update: {
-          score: totalScore,
-          maximumScore: problem.maximumMarks,
-          calculatedAt: new Date(),
-        },
-      });
+      await txExecute(client,
+        `INSERT INTO round_scores (id, "studentId", "roundId", score, "maximumScore", "calculatedAt")
+         VALUES (gen_random_uuid(), $1, $2, $3, $4, NOW())
+         ON CONFLICT ("studentId", "roundId")
+         DO UPDATE SET score = $3, "maximumScore" = $4, "calculatedAt" = NOW()`,
+        [studentId, roundId, totalScore, problem.maximumMarks]
+      );
 
-      // Update RoundProgress
-      await tx.roundProgress.upsert({
-        where: { studentId_roundId: { studentId, roundId } },
-        create: {
-          studentId,
-          roundId,
-          status: RoundProgressStatus.IN_PROGRESS,
-          lastSavedAt: new Date(),
-          stateData: { code },
-        },
-        update: {
-          status: RoundProgressStatus.IN_PROGRESS,
-          lastSavedAt: new Date(),
-          stateData: { code },
-        },
-      });
+      await txExecute(client,
+        `INSERT INTO round_progress (id, "studentId", "roundId", status, "lastSavedAt", "stateData")
+         VALUES (gen_random_uuid(), $1, $2, 'IN_PROGRESS', NOW(), $3)
+         ON CONFLICT ("studentId", "roundId")
+         DO UPDATE SET status = 'IN_PROGRESS', "lastSavedAt" = NOW(), "stateData" = $3`,
+        [studentId, roundId, JSON.stringify({ code })]
+      );
 
       return {
         status: 'success',
-        submissionId: submission.id,
-        submissionNumber: submission.submissionNumber,
-        compileStatus: submission.compileStatus,
-        compileOutput: submission.compileOutput,
-        executionOutput: submission.executionOutput,
+        submissionId: submission!.id,
+        submissionNumber: submission!.submissionNumber,
+        compileStatus: submission!.compileStatus,
+        compileOutput: submission!.compileOutput,
+        executionOutput: submission!.executionOutput,
         newlyFixedBugsCount: bugsToAward.length,
-        totalFixedBugsCount: allStudentAwards.length,
+        totalFixedBugsCount: allAwards.length,
         newScorePoints,
         totalScore,
         maximumScore: problem.maximumMarks,
@@ -565,10 +556,6 @@ export class Round2Service {
     });
   }
 
-  /**
-   * Deterministic Bug Validation Engine.
-   * Validates submitted source code against bug criteria defined in validationConfig.
-   */
   private async validateBug(code: string, validationConfigJson: any): Promise<boolean> {
     if (!validationConfigJson || typeof validationConfigJson !== 'object') {
       return false;
@@ -583,7 +570,6 @@ export class Round2Service {
       pattern?: string;
     };
 
-    // 1. Source code pattern checks
     if (Array.isArray(config.mustInclude)) {
       for (const reqStr of config.mustInclude) {
         if (!code.includes(reqStr)) {
@@ -611,7 +597,6 @@ export class Round2Service {
       }
     }
 
-    // 2. Test case execution check (if expectedOutput is configured)
     if (config.expectedOutput !== undefined) {
       const inputStr = config.input || '';
       const testCase: TestCaseInput = {
@@ -643,7 +628,6 @@ export class Round2Service {
       } else if (method === 'EXACT_IGNORE_CASE') {
         return actual.toLowerCase() === expected.toLowerCase();
       } else {
-        // TRIM
         return actual === expected;
       }
     }
@@ -656,46 +640,67 @@ export class Round2Service {
   // ==========================================
 
   public async getAdminSubmissions(problemId: string, studentId?: string) {
-    const whereClause: any = { debuggingProblemId: problemId };
+    const conditions: string[] = [`"debuggingProblemId" = $1`];
+    const params: any[] = [problemId];
+
     if (studentId) {
-      whereClause.studentId = studentId;
+      params.push(studentId);
+      conditions.push(`"studentId" = $${params.length}`);
     }
 
-    return prisma.debuggingSubmission.findMany({
-      where: whereClause,
-      orderBy: { submittedAt: 'desc' },
-      include: {
-        student: { select: { id: true, studentId: true, fullName: true, batchNumber: true } },
+    const submissions = await query<DbDebuggingSubmission & { student_studentId: string; student_fullName: string; student_batchNumber: string }>(
+      `SELECT ds.*, s."studentId" as "student_studentId", s."fullName" as "student_fullName", s."batchNumber" as "student_batchNumber"
+       FROM debugging_submissions ds
+       JOIN students s ON s.id = ds."studentId"
+       WHERE ${conditions.join(' AND ')}
+       ORDER BY ds."submittedAt" DESC`,
+      params
+    );
+
+    return submissions.map((sub) => ({
+      ...sub,
+      student: {
+        id: sub.studentId,
+        studentId: sub.student_studentId,
+        fullName: sub.student_fullName,
+        batchNumber: sub.student_batchNumber,
       },
-    });
+    }));
   }
 
   public async getRound2Scores(roundId: string) {
-    const students = await prisma.student.findMany({
-      orderBy: { studentId: 'asc' },
-      include: {
-        scores: { where: { roundId } },
-        progresses: { where: { roundId } },
-        bugAwards: { include: { bugDefinition: true } },
-      },
-    });
+    const students = await query<{ id: string; studentId: string; fullName: string; batchNumber: string }>(
+      `SELECT id, "studentId", "fullName", "batchNumber" FROM students ORDER BY "studentId" ASC`
+    );
 
-    return students.map((s) => {
-      const score = s.scores[0];
-      const progress = s.progresses[0];
+    return Promise.all(
+      students.map(async (s) => {
+        const score = await queryOne<DbRoundScore>(
+          `SELECT score, "maximumScore" FROM round_scores WHERE "studentId" = $1 AND "roundId" = $2`,
+          [s.id, roundId]
+        );
+        const progress = await queryOne<DbRoundProgress>(
+          `SELECT status, "submittedAt" FROM round_progress WHERE "studentId" = $1 AND "roundId" = $2`,
+          [s.id, roundId]
+        );
+        const bugAwards = await query<{ id: string }>(
+          `SELECT ba.id FROM bug_awards ba JOIN bug_definitions bd ON bd.id = ba."bugDefinitionId" JOIN debugging_problems dp ON dp.id = bd."debuggingProblemId" WHERE ba."studentId" = $1 AND dp."roundId" = $2`,
+          [s.id, roundId]
+        );
 
-      return {
-        id: s.id,
-        studentId: s.studentId,
-        fullName: s.fullName,
-        batchNumber: s.batchNumber,
-        status: progress ? progress.status : 'NOT_STARTED',
-        score: score ? score.score : 0,
-        maximumScore: score ? score.maximumScore : 0,
-        fixedBugsCount: s.bugAwards.length,
-        submittedAt: progress ? progress.submittedAt : null,
-      };
-    });
+        return {
+          id: s.id,
+          studentId: s.studentId,
+          fullName: s.fullName,
+          batchNumber: s.batchNumber,
+          status: progress ? progress.status : 'NOT_STARTED',
+          score: score ? score.score : 0,
+          maximumScore: score ? score.maximumScore : 0,
+          fixedBugsCount: bugAwards.length,
+          submittedAt: progress ? progress.submittedAt : null,
+        };
+      })
+    );
   }
 }
 

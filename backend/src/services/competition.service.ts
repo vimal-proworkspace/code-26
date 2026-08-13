@@ -1,21 +1,18 @@
-import { prisma } from '../config/database';
-import { RoundType, RoundStatus } from '@prisma/client';
+import { query, queryOne, transaction, txQuery, txQueryOne, txExecute } from '../config/database';
+import { RoundType, DbEvent, DbRound, DbStudent, DbFinalScore, DbVisibilitySettings, DbRoundScore, DbProgrammingSubmission, DbDebuggingSubmission, DbStudentAnswer, DbRoundProgress, DbViolation, DbAuditLog } from '../config/types';
 
 export class CompetitionService {
-  /**
-   * Helper to retrieve primary event ID.
-   */
   private async getPrimaryEventId(): Promise<string> {
-    const event = await prisma.event.findFirst({ orderBy: { createdAt: 'asc' } });
+    const event = await queryOne<DbEvent>(
+      `SELECT * FROM events ORDER BY "createdAt" ASC LIMIT 1`
+    );
     if (!event) {
-      const newEvent = await prisma.event.create({
-        data: {
-          id: 'coding-challenge-2026-event-id',
-          name: 'Coding Challenge 2026',
-          status: 'DRAFT',
-        },
-      });
-      return newEvent.id;
+      const newEvent = await queryOne<DbEvent>(
+        `INSERT INTO events (id, name, status, "createdAt", "updatedAt")
+         VALUES ('coding-challenge-2026-event-id', 'Coding Challenge 2026', 'DRAFT', NOW(), NOW())
+         RETURNING *`
+      );
+      return newEvent!.id;
     }
     return event.id;
   }
@@ -32,71 +29,75 @@ export class CompetitionService {
   public async calculateFinalScores(eventId?: string) {
     const targetEventId = eventId || (await this.getPrimaryEventId());
 
-    const rounds = await prisma.round.findMany({
-      where: { eventId: targetEventId, isEnabled: true },
-      orderBy: { order: 'asc' },
-    });
+    const rounds = await query<DbRound>(
+      `SELECT * FROM rounds WHERE "eventId" = $1 AND "isEnabled" = true ORDER BY "order" ASC`,
+      [targetEventId]
+    );
 
     const round1Obj = rounds.find((r) => r.order === 1 || r.type === RoundType.MCQ);
     const round2Obj = rounds.find((r) => r.order === 2 || r.type === RoundType.DEBUGGING);
     const round3Obj = rounds.find((r) => r.order === 3 || r.type === RoundType.PROGRAMMING);
 
-    const students = await prisma.student.findMany({
-      include: {
-        scores: true,
-        programmingSubmissions: {
-          orderBy: { submittedAt: 'desc' },
-          take: 5,
-        },
-        debuggingSubmissions: {
-          orderBy: { submittedAt: 'desc' },
-          take: 5,
-        },
-      },
-    });
+    const students = await query<DbStudent>(`SELECT * FROM students`);
 
-    const studentCalculatedList = students.map((st) => {
-      const r1ScoreObj = round1Obj ? st.scores.find((s) => s.roundId === round1Obj.id) : null;
-      const r2ScoreObj = round2Obj ? st.scores.find((s) => s.roundId === round2Obj.id) : null;
-      const r3ScoreObj = round3Obj ? st.scores.find((s) => s.roundId === round3Obj.id) : null;
+    const studentCalculatedList = await Promise.all(
+      students.map(async (st) => {
+        const scores = await query<DbRoundScore>(
+          `SELECT * FROM round_scores WHERE "studentId" = $1`,
+          [st.id]
+        );
 
-      const round1Score = r1ScoreObj?.score || 0;
-      const round2Score = r2ScoreObj?.score || 0;
-      const round3Score = r3ScoreObj?.score || 0;
-      const totalScore = round1Score + round2Score + round3Score;
+        const r1ScoreObj = round1Obj ? scores.find((s) => s.roundId === round1Obj.id) : null;
+        const r2ScoreObj = round2Obj ? scores.find((s) => s.roundId === round2Obj.id) : null;
+        const r3ScoreObj = round3Obj ? scores.find((s) => s.roundId === round3Obj.id) : null;
 
-      // Collect tie-breaking metrics
-      let totalExecutionTime = 0;
-      let totalCompileAttempts = 0;
-      let latestSubmissionMs = 0;
+        const round1Score = r1ScoreObj?.score || 0;
+        const round2Score = r2ScoreObj?.score || 0;
+        const round3Score = r3ScoreObj?.score || 0;
+        const totalScore = round1Score + round2Score + round3Score;
 
-      st.programmingSubmissions.forEach((sub) => {
-        if (sub.executionTime) totalExecutionTime += sub.executionTime;
-        if (sub.compileAttempts) totalCompileAttempts += sub.compileAttempts;
-        if (sub.submittedAt) {
-          latestSubmissionMs = Math.max(latestSubmissionMs, sub.submittedAt.getTime());
-        }
-      });
+        const progSubmissions = await query<DbProgrammingSubmission>(
+          `SELECT "executionTime", "compileAttempts", "submittedAt" FROM programming_submissions WHERE "studentId" = $1 ORDER BY "submittedAt" DESC LIMIT 5`,
+          [st.id]
+        );
 
-      st.debuggingSubmissions.forEach((sub) => {
-        if (sub.executionTime) totalExecutionTime += sub.executionTime;
-        if (sub.submittedAt) {
-          latestSubmissionMs = Math.max(latestSubmissionMs, sub.submittedAt.getTime());
-        }
-      });
+        const debugSubmissions = await query<DbDebuggingSubmission>(
+          `SELECT "executionTime", "submittedAt" FROM debugging_submissions WHERE "studentId" = $1 ORDER BY "submittedAt" DESC LIMIT 5`,
+          [st.id]
+        );
 
-      return {
-        studentId: st.id,
-        rawStudent: st,
-        round1Score,
-        round2Score,
-        round3Score,
-        totalScore,
-        totalExecutionTime,
-        totalCompileAttempts,
-        latestSubmissionMs: latestSubmissionMs || Date.now(),
-      };
-    });
+        let totalExecutionTime = 0;
+        let totalCompileAttempts = 0;
+        let latestSubmissionMs = 0;
+
+        progSubmissions.forEach((sub) => {
+          if (sub.executionTime) totalExecutionTime += sub.executionTime;
+          if (sub.compileAttempts) totalCompileAttempts += sub.compileAttempts;
+          if (sub.submittedAt) {
+            latestSubmissionMs = Math.max(latestSubmissionMs, new Date(sub.submittedAt).getTime());
+          }
+        });
+
+        debugSubmissions.forEach((sub) => {
+          if (sub.executionTime) totalExecutionTime += sub.executionTime;
+          if (sub.submittedAt) {
+            latestSubmissionMs = Math.max(latestSubmissionMs, new Date(sub.submittedAt).getTime());
+          }
+        });
+
+        return {
+          studentId: st.id,
+          rawStudent: st,
+          round1Score,
+          round2Score,
+          round3Score,
+          totalScore,
+          totalExecutionTime,
+          totalCompileAttempts,
+          latestSubmissionMs: latestSubmissionMs || Date.now(),
+        };
+      })
+    );
 
     // Deterministic sorting with 5-tier tie-breaking rules
     studentCalculatedList.sort((a, b) => {
@@ -110,70 +111,47 @@ export class CompetitionService {
     });
 
     // Persist FinalScore records with assigned ranks
-    await prisma.$transaction(
-      studentCalculatedList.map((item, index) => {
+    await transaction(async (client) => {
+      for (let index = 0; index < studentCalculatedList.length; index++) {
+        const item = studentCalculatedList[index];
         const rank = index + 1;
-        return prisma.finalScore.upsert({
-          where: { studentId: item.studentId },
-          create: {
-            studentId: item.studentId,
-            round1Score: item.round1Score,
-            round2Score: item.round2Score,
-            round3Score: item.round3Score,
-            totalScore: item.totalScore,
-            rank,
-            status: 'FINAL',
-          },
-          update: {
-            round1Score: item.round1Score,
-            round2Score: item.round2Score,
-            round3Score: item.round3Score,
-            totalScore: item.totalScore,
-            rank,
-            status: 'FINAL',
-          },
-        });
-      })
-    );
+
+        await txExecute(client,
+          `INSERT INTO final_scores (id, "studentId", "round1Score", "round2Score", "round3Score", "totalScore", rank, status, "calculatedAt", "updatedAt")
+           VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, 'FINAL', NOW(), NOW())
+           ON CONFLICT ("studentId")
+           DO UPDATE SET "round1Score" = $2, "round2Score" = $3, "round3Score" = $4,
+                         "totalScore" = $5, rank = $6, status = 'FINAL', "updatedAt" = NOW()`,
+          [item.studentId, item.round1Score, item.round2Score, item.round3Score, item.totalScore, rank]
+        );
+      }
+    });
 
     return studentCalculatedList;
   }
 
-  /**
-   * Retrieves full admin leaderboard.
-   */
   public async getAdminLeaderboard(eventId?: string) {
     const targetEventId = eventId || (await this.getPrimaryEventId());
     await this.calculateFinalScores(targetEventId);
 
-    const event = await prisma.event.findUnique({
-      where: { id: targetEventId },
-      include: { visibility: true },
-    });
+    const event = await queryOne<DbEvent>(`SELECT * FROM events WHERE id = $1`, [targetEventId]);
+    const visibility = await queryOne<DbVisibilitySettings>(`SELECT * FROM visibility_settings WHERE "eventId" = $1`, [targetEventId]);
 
-    const finalScores = await prisma.finalScore.findMany({
-      include: {
-        student: {
-          select: {
-            id: true,
-            studentId: true,
-            fullName: true,
-            batchNumber: true,
-            status: true,
-          },
-        },
-      },
-      orderBy: { rank: 'asc' },
-    });
+    const finalScores = await query<DbFinalScore & { student_studentId: string; student_fullName: string; student_batchNumber: string; student_status: string }>(
+      `SELECT fs.*, s."studentId" as "student_studentId", s."fullName" as "student_fullName", s."batchNumber" as "student_batchNumber", s.status as student_status
+       FROM final_scores fs
+       JOIN students s ON s.id = fs."studentId"
+       ORDER BY fs.rank ASC`
+    );
 
     return {
       eventId: targetEventId,
-      showResults: event?.visibility?.showResults ?? false,
+      showResults: visibility?.showResults ?? false,
       leaderboard: finalScores.map((fs) => ({
         rank: fs.rank,
-        studentId: fs.student.studentId,
-        studentName: fs.student.fullName,
-        batchNumber: fs.student.batchNumber,
+        studentId: fs.student_studentId,
+        studentName: fs.student_fullName,
+        batchNumber: fs.student_batchNumber,
         round1Score: fs.round1Score,
         round2Score: fs.round2Score,
         round3Score: fs.round3Score,
@@ -183,15 +161,13 @@ export class CompetitionService {
     };
   }
 
-  /**
-   * Student leaderboard retrieval, strictly guarded by VisibilitySettings.showResults.
-   */
   public async getStudentLeaderboard(studentDbId: string, eventId?: string) {
     const targetEventId = eventId || (await this.getPrimaryEventId());
 
-    const visibility = await prisma.visibilitySettings.findUnique({
-      where: { eventId: targetEventId },
-    });
+    const visibility = await queryOne<DbVisibilitySettings>(
+      `SELECT * FROM visibility_settings WHERE "eventId" = $1`,
+      [targetEventId]
+    );
 
     if (!visibility?.showResults) {
       throw {
@@ -210,82 +186,104 @@ export class CompetitionService {
     };
   }
 
-  /**
-   * Admin toggle for results visibility (showResults flag).
-   */
   public async toggleResultsVisibility(showResults: boolean, userId?: string) {
     const targetEventId = await this.getPrimaryEventId();
 
-    const updatedVisibility = await prisma.visibilitySettings.upsert({
-      where: { eventId: targetEventId },
-      create: {
-        eventId: targetEventId,
-        showResults,
-      },
-      update: {
-        showResults,
-      },
-    });
+    const updatedVisibility = await queryOne<DbVisibilitySettings>(
+      `INSERT INTO visibility_settings (id, "eventId", "showAnswers", "showResults", "createdAt", "updatedAt")
+       VALUES (gen_random_uuid(), $1, false, $2, NOW(), NOW())
+       ON CONFLICT ("eventId")
+       DO UPDATE SET "showResults" = $2, "updatedAt" = NOW()
+       RETURNING *`,
+      [targetEventId, showResults]
+    );
 
-    await prisma.auditLog.create({
-      data: {
-        action: showResults ? 'RESULTS_PUBLISHED' : 'RESULTS_UNPUBLISHED',
-        entity: 'Event',
-        entityId: targetEventId,
-        userId,
-        metadata: { showResults },
-      },
-    });
+    await query(
+      `INSERT INTO audit_logs (id, action, entity, "entityId", "userId", metadata, "createdAt")
+       VALUES (gen_random_uuid(), $1, 'Event', $2, $3, $4, NOW())`,
+      [showResults ? 'RESULTS_PUBLISHED' : 'RESULTS_UNPUBLISHED', targetEventId, userId || null, JSON.stringify({ showResults })]
+    );
 
     return updatedVisibility;
   }
 
-  /**
-   * Comprehensive admin inspection tool for a single student.
-   */
   public async getAdminStudentInspection(studentIdOrDbId: string) {
-    const student = await prisma.student.findFirst({
-      where: {
-        OR: [{ id: studentIdOrDbId }, { studentId: studentIdOrDbId }],
-      },
-      include: {
-        user: { select: { username: true, isActive: true } },
-        answers: {
-          include: {
-            question: {
-              select: { id: true, questionText: true, marks: true, correctAnswer: true },
-            },
-          },
-        },
-        debuggingSubmissions: {
-          orderBy: { submittedAt: 'desc' },
-          take: 5,
-        },
-        bugAwards: {
-          include: { bugDefinition: true },
-        },
-        programmingSubmissions: {
-          orderBy: { submittedAt: 'desc' },
-          take: 5,
-        },
-        progresses: {
-          include: { round: { select: { id: true, name: true, type: true, order: true } } },
-        },
-        scores: {
-          include: { round: { select: { id: true, name: true, type: true } } },
-        },
-        violations: {
-          orderBy: { timestamp: 'desc' },
-        },
-        finalScore: true,
-      },
-    });
+    const student = await queryOne<DbStudent & { user_username: string; user_isActive: boolean }>(
+      `SELECT s.*, u.username as user_username, u."isActive" as "user_isActive"
+       FROM students s
+       JOIN users u ON u.id = s."userId"
+       WHERE s.id = $1 OR s."studentId" = $1`,
+      [studentIdOrDbId]
+    );
 
     if (!student) {
       throw { statusCode: 404, message: 'Student not found' };
     }
 
-    return student;
+    const answers = await query<DbStudentAnswer & { question_text: string; question_marks: number; question_correctAnswer: string | null }>(
+      `SELECT sa.*, q."questionText" as question_text, q.marks as question_marks, q."correctAnswer" as "question_correctAnswer"
+       FROM student_answers sa
+       JOIN questions q ON q.id = sa."questionId"
+       WHERE sa."studentId" = $1`,
+      [student.id]
+    );
+
+    const debuggingSubmissions = await query<DbDebuggingSubmission>(
+      `SELECT * FROM debugging_submissions WHERE "studentId" = $1 ORDER BY "submittedAt" DESC LIMIT 5`,
+      [student.id]
+    );
+
+    const bugAwards = await query<DbBugAward & { bug_title: string; bug_bugId: string }>(
+      `SELECT ba.*, bd.title as bug_title, bd."bugId" as "bug_bugId"
+       FROM bug_awards ba
+       JOIN bug_definitions bd ON bd.id = ba."bugDefinitionId"
+       WHERE ba."studentId" = $1`,
+      [student.id]
+    );
+
+    const programmingSubmissions = await query<DbProgrammingSubmission>(
+      `SELECT * FROM programming_submissions WHERE "studentId" = $1 ORDER BY "submittedAt" DESC LIMIT 5`,
+      [student.id]
+    );
+
+    const progresses = await query<DbRoundProgress & { round_name: string; round_type: string; round_order: number }>(
+      `SELECT rp.*, r.name as round_name, r.type as round_type, r.order as round_order
+       FROM round_progress rp
+       JOIN rounds r ON r.id = rp."roundId"
+       WHERE rp."studentId" = $1`,
+      [student.id]
+    );
+
+    const scores = await query<DbRoundScore & { round_name: string; round_type: string }>(
+      `SELECT rs.*, r.name as round_name, r.type as round_type
+       FROM round_scores rs
+       JOIN rounds r ON r.id = rs."roundId"
+       WHERE rs."studentId" = $1`,
+      [student.id]
+    );
+
+    const violations = await query<DbViolation>(
+      `SELECT * FROM violations WHERE "studentId" = $1 ORDER BY timestamp DESC`,
+      [student.id]
+    );
+
+    const finalScore = await queryOne<DbFinalScore>(
+      `SELECT * FROM final_scores WHERE "studentId" = $1`,
+      [student.id]
+    );
+
+    return {
+      ...student,
+      user: { username: student.user_username, isActive: student.user_isActive },
+      answers,
+      debuggingSubmissions,
+      bugAwards,
+      programmingSubmissions,
+      progresses,
+      scores,
+      violations,
+      finalScore,
+    };
   }
 }
 

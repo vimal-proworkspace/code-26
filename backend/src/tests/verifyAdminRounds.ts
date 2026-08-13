@@ -1,12 +1,6 @@
-/**
- * Verification Test Script for Step 8: Admin Event & Round Control
- *
- * Usage: npx ts-node src/tests/verifyAdminRounds.ts
- */
-
 import { adminRoundService } from '../services/adminRound.service';
-import { prisma } from '../config/database';
-import { RoundStatus, RoundType } from '@prisma/client';
+import { query, queryOne, execute, closePool } from '../config/database';
+import { DbAuditLog } from '../config/types';
 
 interface TestResult {
   name: string;
@@ -45,7 +39,6 @@ async function main() {
     assert(!!event, 'Event must exist');
     assert(rounds.length >= 3, `Expected at least 3 rounds, got ${rounds.length}`);
 
-    // Verify ordering is strictly ascending
     for (let i = 0; i < rounds.length - 1; i++) {
       assert(rounds[i].order <= rounds[i + 1].order, `Rounds must be ordered ascending: #${rounds[i].order} > #${rounds[i + 1].order}`);
     }
@@ -58,7 +51,7 @@ async function main() {
   await runTest('Create New Round', async () => {
     const round = await adminRoundService.createRound({
       name: 'ROUND 4 — Final Challenge',
-      type: RoundType.PROGRAMMING,
+      type: 'PROGRAMMING',
       description: 'Test extra round',
       duration: 60,
       maximumMarks: 200,
@@ -66,7 +59,7 @@ async function main() {
 
     assert(!!round.id, 'Created round must have ID');
     assert(round.name === 'ROUND 4 — Final Challenge', 'Name must match');
-    assert(round.status === RoundStatus.DRAFT, 'New round must start in DRAFT status');
+    assert(round.status === 'DRAFT', 'New round must start in DRAFT status');
     createdRoundId = round.id;
   });
 
@@ -104,8 +97,8 @@ async function main() {
     round2Id = r2!.id;
 
     // Reset status to DRAFT for clean testing if previously altered
-    await prisma.round.update({ where: { id: round1Id }, data: { status: RoundStatus.DRAFT, remainingSeconds: null, startTime: null, endTime: null } });
-    await prisma.round.update({ where: { id: round2Id }, data: { status: RoundStatus.DRAFT, remainingSeconds: null, startTime: null, endTime: null } });
+    await execute(`UPDATE rounds SET status = 'DRAFT', "remainingSeconds" = NULL, "startTime" = NULL, "endTime" = NULL WHERE id = $1`, [round1Id]);
+    await execute(`UPDATE rounds SET status = 'DRAFT', "remainingSeconds" = NULL, "startTime" = NULL, "endTime" = NULL WHERE id = $2`, [round2Id]);
   });
 
   await runTest('Sequential Rule: Cannot start Round 2 while Round 1 is DRAFT', async () => {
@@ -120,11 +113,11 @@ async function main() {
 
   await runTest('Start Round 1 (Server Timing & LIVE transition)', async () => {
     const started = await adminRoundService.startRound(round1Id);
-    assert(started.status === RoundStatus.LIVE, `Expected status LIVE, got ${started.status}`);
+    assert(started.status === 'LIVE', `Expected status LIVE, got ${started.status}`);
     assert(!!started.startTime, 'startTime must be set by server clock');
     assert(!!started.endTime, 'endTime must be calculated by server clock');
 
-    const durationMs = started.endTime!.getTime() - started.startTime!.getTime();
+    const durationMs = new Date(started.endTime!).getTime() - new Date(started.startTime!).getTime();
     const durationMins = Math.round(durationMs / (60 * 1000));
     assert(durationMins === started.duration, `Expected duration ${started.duration} mins, calculated ${durationMins}`);
   });
@@ -141,13 +134,13 @@ async function main() {
 
   await runTest('Pause Round 1 (Stores remaining time)', async () => {
     const paused = await adminRoundService.pauseRound(round1Id);
-    assert(paused.status === RoundStatus.PAUSED, `Expected PAUSED status, got ${paused.status}`);
+    assert(paused.status === 'PAUSED', `Expected PAUSED status, got ${paused.status}`);
     assert(paused.remainingSeconds !== null && paused.remainingSeconds !== undefined, 'remainingSeconds must be stored');
   });
 
   await runTest('Resume Round 1 (Recalculates deadline)', async () => {
     const resumed = await adminRoundService.resumeRound(round1Id);
-    assert(resumed.status === RoundStatus.LIVE, `Expected LIVE status, got ${resumed.status}`);
+    assert(resumed.status === 'LIVE', `Expected LIVE status, got ${resumed.status}`);
     assert(!!resumed.startTime, 'New startTime must be set');
     assert(!!resumed.endTime, 'New endTime must be set');
     assert(resumed.remainingSeconds === null, 'remainingSeconds must be cleared after resume');
@@ -155,14 +148,13 @@ async function main() {
 
   await runTest('End Round 1 (Transitions to ENDED)', async () => {
     const ended = await adminRoundService.endRound(round1Id);
-    assert(ended.status === RoundStatus.ENDED, `Expected ENDED status, got ${ended.status}`);
+    assert(ended.status === 'ENDED', `Expected ENDED status, got ${ended.status}`);
   });
 
   await runTest('Sequential Rule: Start Round 2 after Round 1 is ENDED', async () => {
     const started = await adminRoundService.startRound(round2Id);
-    assert(started.status === RoundStatus.LIVE, `Expected Round 2 status LIVE, got ${started.status}`);
+    assert(started.status === 'LIVE', `Expected Round 2 status LIVE, got ${started.status}`);
 
-    // End Round 2 to leave database clean
     await adminRoundService.endRound(round2Id);
   });
 
@@ -176,11 +168,9 @@ async function main() {
   });
 
   await runTest('Verify Audit Logs in PostgreSQL', async () => {
-    const logs = await prisma.auditLog.findMany({
-      where: { entity: 'Round' },
-      take: 10,
-      orderBy: { createdAt: 'desc' },
-    });
+    const logs = await query<DbAuditLog>(
+      `SELECT * FROM audit_logs WHERE entity = 'Round' ORDER BY "createdAt" DESC LIMIT 10`
+    );
 
     assert(logs.length > 0, 'Audit logs must exist for round operations');
     const actions = logs.map((l) => l.action);
@@ -211,7 +201,7 @@ async function main() {
   }
 
   console.log(`\nOverall: ${failed === 0 ? '✅ ALL PASSED' : '❌ SOME FAILED'}`);
-  await prisma.$disconnect();
+  await closePool();
   process.exit(failed > 0 ? 1 : 0);
 }
 

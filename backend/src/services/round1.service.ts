@@ -1,5 +1,5 @@
-import { QuestionType, ComparisonMethod, RoundStatus, RoundProgressStatus } from '@prisma/client';
-import { prisma } from '../config/database';
+import { QuestionType, ComparisonMethod, RoundStatus, RoundProgressStatus, DbQuestion, DbQuestionOption, DbStudentAnswer, DbRoundProgress, DbRoundScore, DbRound } from '../config/types';
+import { query, queryOne, transaction, txQuery, txQueryOne, txExecute } from '../config/database';
 
 export interface CreateOptionInput {
   optionKey: string;
@@ -36,20 +36,13 @@ export interface UpdateQuestionInput {
 }
 
 export class Round1Service {
-  /**
-   * Writes audit log entries safely.
-   */
   private async logAudit(action: string, entityId: string, userId?: string, metadata?: Record<string, unknown>) {
     try {
-      await prisma.auditLog.create({
-        data: {
-          action,
-          entity: 'Question',
-          entityId,
-          userId,
-          metadata: metadata ? JSON.parse(JSON.stringify(metadata)) : undefined,
-        },
-      });
+      await query(
+        `INSERT INTO audit_logs (id, action, entity, "entityId", "userId", metadata, "createdAt")
+         VALUES (gen_random_uuid(), $1, 'Question', $2, $3, $4, NOW())`,
+        [action, entityId, userId || null, metadata ? JSON.stringify(metadata) : null]
+      );
     } catch (err) {
       console.error('Failed to create Round 1 audit log:', err);
     }
@@ -59,23 +52,31 @@ export class Round1Service {
   // ADMIN QUESTION MANAGEMENT
   // ==========================================
 
-  /**
-   * Retrieves all questions for Round 1 (Admin view with correct answers & options).
-   */
   public async getAdminQuestions(roundId: string) {
-    return prisma.question.findMany({
-      where: { roundId },
-      orderBy: { order: 'asc' },
-      include: {
-        options: { orderBy: { order: 'asc' } },
-        _count: { select: { studentAnswers: true } },
-      },
-    });
+    const questions = await query<DbQuestion>(
+      `SELECT * FROM questions WHERE "roundId" = $1 ORDER BY "order" ASC`,
+      [roundId]
+    );
+
+    return Promise.all(
+      questions.map(async (q) => {
+        const options = await query<DbQuestionOption>(
+          `SELECT * FROM question_options WHERE "questionId" = $1 ORDER BY "order" ASC`,
+          [q.id]
+        );
+        const countRes = await queryOne<{ count: string }>(
+          `SELECT COUNT(*) FROM student_answers WHERE "questionId" = $1`,
+          [q.id]
+        );
+        return {
+          ...q,
+          options,
+          _count: { studentAnswers: parseInt(countRes?.count || '0', 10) },
+        };
+      })
+    );
   }
 
-  /**
-   * Creates a new question (MCQ or OUTPUT_PREDICTION) for Round 1.
-   */
   public async createQuestion(roundId: string, input: CreateQuestionInput, userId?: string) {
     const questionText = (input.questionText || '').trim();
     if (!questionText) {
@@ -88,14 +89,13 @@ export class Round1Service {
       throw { statusCode: 400, message: 'Marks must be greater than 0' };
     }
 
-    // Determine order
     let order = input.order;
     if (order === undefined || order === null) {
-      const lastQ = await prisma.question.findFirst({
-        where: { roundId },
-        orderBy: { order: 'desc' },
-      });
-      order = (lastQ?.order || 0) + 1;
+      const lastQ = await queryOne<{ max_order: number }>(
+        `SELECT MAX("order") as max_order FROM questions WHERE "roundId" = $1`,
+        [roundId]
+      );
+      order = (lastQ?.max_order || 0) + 1;
     }
 
     if (input.questionType === QuestionType.MCQ) {
@@ -113,133 +113,135 @@ export class Round1Service {
       }
     }
 
-    return await prisma.$transaction(async (tx) => {
-      const question = await tx.question.create({
-        data: {
+    return await transaction(async (client) => {
+      const question = await txQueryOne<DbQuestion>(client,
+        `INSERT INTO questions (id, "roundId", "questionText", "questionType", marks, "negativeMarks", "order", "isActive", "correctAnswer", code, "correctOutput", "comparisonMethod", "createdAt", "updatedAt")
+         VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW(), NOW())
+         RETURNING *`,
+        [
           roundId,
           questionText,
-          questionType: input.questionType,
-          marks: input.marks,
-          negativeMarks: input.negativeMarks || 0,
+          input.questionType,
+          input.marks,
+          input.negativeMarks || 0,
           order,
-          isActive: input.isActive !== undefined ? input.isActive : true,
-          correctAnswer: input.correctAnswer,
-          code: input.code,
-          correctOutput: input.correctOutput,
-          comparisonMethod: input.comparisonMethod || ComparisonMethod.TRIM,
-        },
-      });
+          input.isActive !== undefined ? input.isActive : true,
+          input.correctAnswer || null,
+          input.code || null,
+          input.correctOutput || null,
+          input.comparisonMethod || ComparisonMethod.TRIM,
+        ]
+      );
+
+      if (!question) {
+        throw { statusCode: 500, message: 'Failed to create question' };
+      }
 
       if (input.questionType === QuestionType.MCQ && input.options) {
         for (const opt of input.options) {
-          await tx.questionOption.create({
-            data: {
-              questionId: question.id,
-              optionKey: opt.optionKey,
-              optionText: opt.optionText,
-              order: opt.order,
-            },
-          });
+          await txExecute(client,
+            `INSERT INTO question_options (id, "questionId", "optionKey", "optionText", "order")
+             VALUES (gen_random_uuid(), $1, $2, $3, $4)`,
+            [question.id, opt.optionKey, opt.optionText, opt.order]
+          );
         }
       }
 
-      await this.logAudit('QUESTION_CREATED', question.id, userId, { questionText: question.questionText });
+      await txExecute(client,
+        `INSERT INTO audit_logs (id, action, entity, "entityId", "userId", metadata, "createdAt")
+         VALUES (gen_random_uuid(), 'QUESTION_CREATED', 'Question', $1, $2, $3, NOW())`,
+        [question.id, userId || null, JSON.stringify({ questionText: question.questionText })]
+      );
 
-      return tx.question.findUnique({
-        where: { id: question.id },
-        include: { options: { orderBy: { order: 'asc' } } },
-      });
+      const options = await txQuery<DbQuestionOption>(client,
+        `SELECT * FROM question_options WHERE "questionId" = $1 ORDER BY "order" ASC`,
+        [question.id]
+      );
+
+      return { ...question, options };
     });
   }
 
-  /**
-   * Updates an existing question and options.
-   */
   public async updateQuestion(id: string, input: UpdateQuestionInput, userId?: string) {
-    const existing = await prisma.question.findUnique({ where: { id } });
+    const existing = await queryOne<DbQuestion>(`SELECT * FROM questions WHERE id = $1`, [id]);
     if (!existing) {
       throw { statusCode: 404, message: 'Question not found' };
     }
 
-    return await prisma.$transaction(async (tx) => {
-      const updated = await tx.question.update({
-        where: { id },
-        data: {
-          questionText: input.questionText !== undefined ? input.questionText.trim() : undefined,
-          questionType: input.questionType,
-          marks: input.marks,
-          negativeMarks: input.negativeMarks,
-          order: input.order,
-          isActive: input.isActive,
-          correctAnswer: input.correctAnswer,
-          code: input.code,
-          correctOutput: input.correctOutput,
-          comparisonMethod: input.comparisonMethod,
-        },
-      });
+    return await transaction(async (client) => {
+      const questionText = input.questionText !== undefined ? input.questionText.trim() : existing.questionText;
+      const questionType = input.questionType !== undefined ? input.questionType : existing.questionType;
+      const marks = input.marks !== undefined ? input.marks : existing.marks;
+      const negativeMarks = input.negativeMarks !== undefined ? input.negativeMarks : existing.negativeMarks;
+      const order = input.order !== undefined ? input.order : existing.order;
+      const isActive = input.isActive !== undefined ? input.isActive : existing.isActive;
+      const correctAnswer = input.correctAnswer !== undefined ? input.correctAnswer : existing.correctAnswer;
+      const code = input.code !== undefined ? input.code : existing.code;
+      const correctOutput = input.correctOutput !== undefined ? input.correctOutput : existing.correctOutput;
+      const comparisonMethod = input.comparisonMethod !== undefined ? input.comparisonMethod : existing.comparisonMethod;
 
-      // Update options if provided for MCQ
-      if (input.options && (updated.questionType === QuestionType.MCQ || updated.questionType === QuestionType.MULTIPLE_CHOICE)) {
-        await tx.questionOption.deleteMany({ where: { questionId: id } });
+      const updated = await txQueryOne<DbQuestion>(client,
+        `UPDATE questions
+         SET "questionText" = $1, "questionType" = $2, marks = $3, "negativeMarks" = $4,
+             "order" = $5, "isActive" = $6, "correctAnswer" = $7, code = $8,
+             "correctOutput" = $9, "comparisonMethod" = $10, "updatedAt" = NOW()
+         WHERE id = $11
+         RETURNING *`,
+        [questionText, questionType, marks, negativeMarks, order, isActive, correctAnswer, code, correctOutput, comparisonMethod, id]
+      );
+
+      if (input.options && (questionType === QuestionType.MCQ || questionType === QuestionType.MULTIPLE_CHOICE)) {
+        await txExecute(client, `DELETE FROM question_options WHERE "questionId" = $1`, [id]);
         for (const opt of input.options) {
-          await tx.questionOption.create({
-            data: {
-              questionId: id,
-              optionKey: opt.optionKey,
-              optionText: opt.optionText,
-              order: opt.order,
-            },
-          });
+          await txExecute(client,
+            `INSERT INTO question_options (id, "questionId", "optionKey", "optionText", "order")
+             VALUES (gen_random_uuid(), $1, $2, $3, $4)`,
+            [id, opt.optionKey, opt.optionText, opt.order]
+          );
         }
       }
 
-      await this.logAudit('QUESTION_UPDATED', id, userId);
+      await txExecute(client,
+        `INSERT INTO audit_logs (id, action, entity, "entityId", "userId", metadata, "createdAt")
+         VALUES (gen_random_uuid(), 'QUESTION_UPDATED', 'Question', $1, $2, NULL, NOW())`,
+        [id, userId || null]
+      );
 
-      return tx.question.findUnique({
-        where: { id },
-        include: { options: { orderBy: { order: 'asc' } } },
-      });
+      const options = await txQuery<DbQuestionOption>(client,
+        `SELECT * FROM question_options WHERE "questionId" = $1 ORDER BY "order" ASC`,
+        [id]
+      );
+
+      return { ...updated, options };
     });
   }
 
-  /**
-   * Deletes a question. If student answers exist, deactivates it instead to preserve history.
-   */
   public async deleteQuestion(id: string, userId?: string) {
-    const question = await prisma.question.findUnique({
-      where: { id },
-      include: { _count: { select: { studentAnswers: true } } },
-    });
-
+    const question = await queryOne<DbQuestion>(`SELECT * FROM questions WHERE id = $1`, [id]);
     if (!question) {
       throw { statusCode: 404, message: 'Question not found' };
     }
 
-    if (question._count.studentAnswers > 0) {
-      // Soft deactivate to preserve student answer integrity
-      await prisma.question.update({
-        where: { id },
-        data: { isActive: false },
-      });
+    const answerCountRes = await queryOne<{ count: string }>(
+      `SELECT COUNT(*) FROM student_answers WHERE "questionId" = $1`,
+      [id]
+    );
+
+    if (parseInt(answerCountRes?.count || '0', 10) > 0) {
+      await query(`UPDATE questions SET "isActive" = false, "updatedAt" = NOW() WHERE id = $1`, [id]);
       await this.logAudit('QUESTION_DEACTIVATED', id, userId, { reason: 'Has student answers' });
       return { message: 'Question deactivated (student answers preserved)' };
     }
 
-    await prisma.question.delete({ where: { id } });
+    await query(`DELETE FROM questions WHERE id = $1`, [id]);
     await this.logAudit('QUESTION_DELETED', id, userId);
     return { message: 'Question deleted successfully' };
   }
 
-  /**
-   * Reorders questions in a round.
-   */
   public async reorderQuestions(roundId: string, orderedQuestionIds: string[], userId?: string) {
-    await prisma.$transaction(async (tx) => {
+    await transaction(async (client) => {
       for (let i = 0; i < orderedQuestionIds.length; i++) {
-        await tx.question.update({
-          where: { id: orderedQuestionIds[i] },
-          data: { order: i + 1 },
-        });
+        await txExecute(client, `UPDATE questions SET "order" = $1, "updatedAt" = NOW() WHERE id = $2`, [i + 1, orderedQuestionIds[i]]);
       }
     });
 
@@ -250,45 +252,39 @@ export class Round1Service {
     return this.getAdminQuestions(roundId);
   }
 
-  /**
-   * Toggles question active status.
-   */
   public async toggleQuestionActive(id: string, isActive: boolean, userId?: string) {
-    const question = await prisma.question.update({
-      where: { id },
-      data: { isActive },
-    });
+    const question = await queryOne<DbQuestion>(
+      `UPDATE questions SET "isActive" = $1, "updatedAt" = NOW() WHERE id = $2 RETURNING *`,
+      [isActive, id]
+    );
     await this.logAudit(isActive ? 'QUESTION_ACTIVATED' : 'QUESTION_DEACTIVATED', id, userId);
     return question;
   }
 
   // ==========================================
-  // STUDENT QUIZ & ANSWERS (PROTECTED)
+  // STUDENT QUIZ & ANSWERS
   // ==========================================
 
-  /**
-   * Loads Round 1 questions for a student while LIVE.
-   * STRIPS SENSITIVE FIELDS (correctAnswer, correctOutput, comparisonMethod).
-   */
   public async getStudentQuiz(roundId: string, studentId: string) {
-    const round = await prisma.round.findUnique({ where: { id: roundId } });
+    const round = await queryOne<DbRound>(`SELECT * FROM rounds WHERE id = $1`, [roundId]);
     if (!round) {
       throw { statusCode: 404, message: 'Round not found' };
     }
 
-    if (round.status !== RoundStatus.LIVE) {
+    if (round.status !== 'LIVE') {
       throw { statusCode: 400, message: `Round 1 is currently ${round.status}. Quiz is accessible only when LIVE.` };
     }
 
-    // Check if student has already submitted Round 1
-    const progress = await prisma.roundProgress.findUnique({
-      where: { studentId_roundId: { studentId, roundId } },
-    });
+    const progress = await queryOne<DbRoundProgress>(
+      `SELECT * FROM round_progress WHERE "studentId" = $1 AND "roundId" = $2`,
+      [studentId, roundId]
+    );
 
-    if (progress && progress.status === RoundProgressStatus.SUBMITTED) {
-      const score = await prisma.roundScore.findUnique({
-        where: { studentId_roundId: { studentId, roundId } },
-      });
+    if (progress && progress.status === 'SUBMITTED') {
+      const score = await queryOne<DbRoundScore>(
+        `SELECT * FROM round_scores WHERE "studentId" = $1 AND "roundId" = $2`,
+        [studentId, roundId]
+      );
       return {
         isSubmitted: true,
         submittedAt: progress.submittedAt,
@@ -298,53 +294,42 @@ export class Round1Service {
       };
     }
 
-    // Calculate server remaining seconds
     const now = Date.now();
-    const endTimeMs = round.endTime ? round.endTime.getTime() : now;
+    const endTimeMs = round.endTime ? new Date(round.endTime).getTime() : now;
     const remainingSeconds = Math.max(0, Math.floor((endTimeMs - now) / 1000));
 
-    // Fetch active questions and options
-    const questions = await prisma.question.findMany({
-      where: { roundId, isActive: true },
-      orderBy: { order: 'asc' },
-      include: {
-        options: {
-          orderBy: { order: 'asc' },
-          select: {
-            id: true,
-            questionId: true,
-            optionKey: true,
-            optionText: true,
-            order: true,
-          },
-        },
-      },
-    });
+    const questions = await query<DbQuestion>(
+      `SELECT * FROM questions WHERE "roundId" = $1 AND "isActive" = true ORDER BY "order" ASC`,
+      [roundId]
+    );
 
-    // STRIP SENSITIVE FIELDS from student response
-    const sanitizedQuestions = questions.map((q) => ({
-      id: q.id,
-      roundId: q.roundId,
-      questionText: q.questionText,
-      questionType: q.questionType,
-      code: q.code,
-      marks: q.marks,
-      negativeMarks: q.negativeMarks,
-      order: q.order,
-      options: q.options,
-    }));
+    const sanitizedQuestions = await Promise.all(
+      questions.map(async (q) => {
+        const options = await query<DbQuestionOption>(
+          `SELECT id, "questionId", "optionKey", "optionText", "order" FROM question_options WHERE "questionId" = $1 ORDER BY "order" ASC`,
+          [q.id]
+        );
+        return {
+          id: q.id,
+          roundId: q.roundId,
+          questionText: q.questionText,
+          questionType: q.questionType,
+          code: q.code,
+          marks: q.marks,
+          negativeMarks: q.negativeMarks,
+          order: q.order,
+          options,
+        };
+      })
+    );
 
-    // Fetch student's existing saved answers
-    const savedAnswers = await prisma.studentAnswer.findMany({
-      where: {
-        studentId,
-        question: { roundId },
-      },
-      select: {
-        questionId: true,
-        answer: true,
-      },
-    });
+    const savedAnswers = await query<{ questionId: string; answer: string }>(
+      `SELECT sa."questionId", sa.answer
+       FROM student_answers sa
+       JOIN questions q ON q.id = sa."questionId"
+       WHERE sa."studentId" = $1 AND q."roundId" = $2`,
+      [studentId, roundId]
+    );
 
     return {
       isSubmitted: false,
@@ -360,37 +345,33 @@ export class Round1Service {
     };
   }
 
-  /**
-   * Auto-saves a student's answer for a question in PostgreSQL.
-   */
   public async saveStudentAnswer(roundId: string, studentId: string, questionId: string, answer: string) {
-    const round = await prisma.round.findUnique({ where: { id: roundId } });
-    if (!round || round.status !== RoundStatus.LIVE) {
+    const round = await queryOne<DbRound>(`SELECT * FROM rounds WHERE id = $1`, [roundId]);
+    if (!round || round.status !== 'LIVE') {
       throw { statusCode: 400, message: 'Cannot save answers: Round 1 is not LIVE' };
     }
 
-    // Check deadline
-    if (round.endTime && new Date() > round.endTime) {
+    if (round.endTime && new Date() > new Date(round.endTime)) {
       throw { statusCode: 400, message: 'Round 1 deadline has passed' };
     }
 
-    // Check submission & lock status
-    const progress = await prisma.roundProgress.findUnique({
-      where: { studentId_roundId: { studentId, roundId } },
-    });
+    const progress = await queryOne<DbRoundProgress>(
+      `SELECT * FROM round_progress WHERE "studentId" = $1 AND "roundId" = $2`,
+      [studentId, roundId]
+    );
 
-    if (progress && progress.status === RoundProgressStatus.LOCKED) {
+    if (progress && progress.status === 'LOCKED') {
       throw { statusCode: 403, message: 'Competition interface is locked due to violation limit. Contact invigilator.' };
     }
 
-    if (progress && progress.status === RoundProgressStatus.SUBMITTED) {
+    if (progress && progress.status === 'SUBMITTED') {
       throw { statusCode: 400, message: 'Cannot modify answers: Round 1 has been submitted' };
     }
 
-    // Verify question belongs to round and is active
-    const question = await prisma.question.findFirst({
-      where: { id: questionId, roundId, isActive: true },
-    });
+    const question = await queryOne<DbQuestion>(
+      `SELECT * FROM questions WHERE id = $1 AND "roundId" = $2 AND "isActive" = true`,
+      [questionId, roundId]
+    );
 
     if (!question) {
       throw { statusCode: 404, message: 'Question not found or inactive' };
@@ -398,60 +379,48 @@ export class Round1Service {
 
     const trimmedAnswer = (answer || '').trim();
 
-    // Upsert student answer in PostgreSQL
-    const savedAnswer = await prisma.studentAnswer.upsert({
-      where: { studentId_questionId: { studentId, questionId } },
-      create: {
-        studentId,
-        questionId,
-        answer: trimmedAnswer,
-      },
-      update: {
-        answer: trimmedAnswer,
-        updatedAt: new Date(),
-      },
-    });
+    // Upsert student answer in PostgreSQL using ON CONFLICT
+    const savedAnswer = await queryOne<DbStudentAnswer>(
+      `INSERT INTO student_answers (id, "studentId", "questionId", answer, "submittedAt", "updatedAt")
+       VALUES (gen_random_uuid(), $1, $2, $3, NOW(), NOW())
+       ON CONFLICT ("studentId", "questionId")
+       DO UPDATE SET answer = $3, "updatedAt" = NOW()
+       RETURNING *`,
+      [studentId, questionId, trimmedAnswer]
+    );
 
-    // Ensure RoundProgress exists and is IN_PROGRESS
-    await prisma.roundProgress.upsert({
-      where: { studentId_roundId: { studentId, roundId } },
-      create: {
-        studentId,
-        roundId,
-        status: RoundProgressStatus.IN_PROGRESS,
-        startedAt: new Date(),
-      },
-      update: {
-        status: RoundProgressStatus.IN_PROGRESS,
-      },
-    });
+    // Upsert RoundProgress
+    await query(
+      `INSERT INTO round_progress (id, "studentId", "roundId", status, "startedAt")
+       VALUES (gen_random_uuid(), $1, $2, 'IN_PROGRESS', NOW())
+       ON CONFLICT ("studentId", "roundId")
+       DO UPDATE SET status = 'IN_PROGRESS'`,
+      [studentId, roundId]
+    );
 
     return {
       status: 'success',
       questionId,
-      answer: savedAnswer.answer,
+      answer: savedAnswer!.answer,
     };
   }
 
-  /**
-   * Submits Round 1 for a student, evaluates answers against correct criteria,
-   * calculates marks and negative marks, floors score at 0, and records RoundScore.
-   */
   public async submitStudentRound1(roundId: string, studentId: string) {
-    return await prisma.$transaction(async (tx) => {
-      // Check if already submitted
-      const existingProgress = await tx.roundProgress.findUnique({
-        where: { studentId_roundId: { studentId, roundId } },
-      });
+    return await transaction(async (client) => {
+      const existingProgress = await txQueryOne<DbRoundProgress>(client,
+        `SELECT * FROM round_progress WHERE "studentId" = $1 AND "roundId" = $2`,
+        [studentId, roundId]
+      );
 
-      if (existingProgress && existingProgress.status === RoundProgressStatus.LOCKED) {
+      if (existingProgress && existingProgress.status === 'LOCKED') {
         throw { statusCode: 403, message: 'Competition interface is locked due to violation limit. Contact invigilator.' };
       }
 
-      if (existingProgress && existingProgress.status === RoundProgressStatus.SUBMITTED) {
-        const existingScore = await tx.roundScore.findUnique({
-          where: { studentId_roundId: { studentId, roundId } },
-        });
+      if (existingProgress && existingProgress.status === 'SUBMITTED') {
+        const existingScore = await txQueryOne<DbRoundScore>(client,
+          `SELECT * FROM round_scores WHERE "studentId" = $1 AND "roundId" = $2`,
+          [studentId, roundId]
+        );
         return {
           status: 'SUBMITTED',
           score: existingScore ? existingScore.score : 0,
@@ -460,18 +429,15 @@ export class Round1Service {
         };
       }
 
-      // Fetch all active questions with correct answers
-      const questions = await tx.question.findMany({
-        where: { roundId, isActive: true },
-      });
+      const questions = await txQuery<DbQuestion>(client,
+        `SELECT * FROM questions WHERE "roundId" = $1 AND "isActive" = true`,
+        [roundId]
+      );
 
-      // Fetch student's saved answers
-      const studentAnswers = await tx.studentAnswer.findMany({
-        where: {
-          studentId,
-          question: { roundId },
-        },
-      });
+      const studentAnswers = await txQuery<DbStudentAnswer>(client,
+        `SELECT sa.* FROM student_answers sa JOIN questions q ON q.id = sa."questionId" WHERE sa."studentId" = $1 AND q."roundId" = $2`,
+        [studentId, roundId]
+      );
 
       const answerMap = new Map<string, string>();
       for (const sa of studentAnswers) {
@@ -508,7 +474,6 @@ export class Round1Service {
           } else if (q.comparisonMethod === ComparisonMethod.EXACT_IGNORE_CASE) {
             isCorrect = actual.toLowerCase() === expected.toLowerCase();
           } else {
-            // Default TRIM
             isCorrect = actual === expected;
           }
         }
@@ -522,63 +487,37 @@ export class Round1Service {
         }
       }
 
-      // Floor score at 0
       const finalScore = Math.max(0, totalScore);
 
-      // Upsert RoundScore
-      const scoreRecord = await tx.roundScore.upsert({
-        where: { studentId_roundId: { studentId, roundId } },
-        create: {
-          studentId,
-          roundId,
-          score: finalScore,
-          maximumScore,
-          calculatedAt: new Date(),
-        },
-        update: {
-          score: finalScore,
-          maximumScore,
-          calculatedAt: new Date(),
-        },
-      });
+      const scoreRecord = await txQueryOne<DbRoundScore>(client,
+        `INSERT INTO round_scores (id, "studentId", "roundId", score, "maximumScore", "submittedAt", "calculatedAt")
+         VALUES (gen_random_uuid(), $1, $2, $3, $4, NOW(), NOW())
+         ON CONFLICT ("studentId", "roundId")
+         DO UPDATE SET score = $3, "maximumScore" = $4, "calculatedAt" = NOW()
+         RETURNING *`,
+        [studentId, roundId, finalScore, maximumScore]
+      );
 
-      // Update RoundProgress to SUBMITTED
-      const progressRecord = await tx.roundProgress.upsert({
-        where: { studentId_roundId: { studentId, roundId } },
-        create: {
-          studentId,
-          roundId,
-          status: RoundProgressStatus.SUBMITTED,
-          submittedAt: new Date(),
-        },
-        update: {
-          status: RoundProgressStatus.SUBMITTED,
-          submittedAt: new Date(),
-        },
-      });
+      const progressRecord = await txQueryOne<DbRoundProgress>(client,
+        `INSERT INTO round_progress (id, "studentId", "roundId", status, "submittedAt")
+         VALUES (gen_random_uuid(), $1, $2, 'SUBMITTED', NOW())
+         ON CONFLICT ("studentId", "roundId")
+         DO UPDATE SET status = 'SUBMITTED', "submittedAt" = NOW()
+         RETURNING *`,
+        [studentId, roundId]
+      );
 
-      await tx.auditLog.create({
-        data: {
-          action: 'ROUND1_SUBMITTED',
-          entity: 'RoundScore',
-          entityId: scoreRecord.id,
-          userId: studentId,
-          metadata: {
-            roundId,
-            score: finalScore,
-            maximumScore,
-            correctCount,
-            incorrectCount,
-            unansweredCount,
-          },
-        },
-      });
+      await txExecute(client,
+        `INSERT INTO audit_logs (id, action, entity, "entityId", "userId", metadata, "createdAt")
+         VALUES (gen_random_uuid(), 'ROUND1_SUBMITTED', 'RoundScore', $1, $2, $3, NOW())`,
+        [scoreRecord!.id, studentId, JSON.stringify({ roundId, score: finalScore, maximumScore, correctCount, incorrectCount, unansweredCount })]
+      );
 
       return {
         status: 'SUBMITTED',
         score: finalScore,
         maximumScore,
-        submittedAt: progressRecord.submittedAt,
+        submittedAt: progressRecord!.submittedAt,
         correctCount,
         incorrectCount,
         unansweredCount,
@@ -590,80 +529,87 @@ export class Round1Service {
   // ADMIN INSPECTION & RESULTS
   // ==========================================
 
-  /**
-   * Returns a student's Round 1 answers, correct answers, awarded marks, and overall score for Admin inspection.
-   */
   public async getStudentRound1Answers(roundId: string, studentId: string) {
-    const student = await prisma.student.findUnique({
-      where: { id: studentId },
-    });
+    const student = await queryOne<{ id: string; studentId: string; fullName: string; batchNumber: string }>(
+      `SELECT id, "studentId", "fullName", "batchNumber" FROM students WHERE id = $1`,
+      [studentId]
+    );
 
     if (!student) {
       throw { statusCode: 404, message: 'Student not found' };
     }
 
-    const questions = await prisma.question.findMany({
-      where: { roundId, isActive: true },
-      orderBy: { order: 'asc' },
-      include: { options: { orderBy: { order: 'asc' } } },
-    });
+    const questions = await query<DbQuestion>(
+      `SELECT * FROM questions WHERE "roundId" = $1 AND "isActive" = true ORDER BY "order" ASC`,
+      [roundId]
+    );
 
-    const studentAnswers = await prisma.studentAnswer.findMany({
-      where: { studentId: student.id, question: { roundId } },
-    });
+    const studentAnswers = await query<DbStudentAnswer>(
+      `SELECT sa.* FROM student_answers sa JOIN questions q ON q.id = sa."questionId" WHERE sa."studentId" = $1 AND q."roundId" = $2`,
+      [student.id, roundId]
+    );
 
     const answerMap = new Map<string, string>();
     for (const sa of studentAnswers) {
       answerMap.set(sa.questionId, sa.answer);
     }
 
-    const questionBreakdown = questions.map((q) => {
-      const studentAns = answerMap.get(q.id) || '';
-      let isCorrect = false;
+    const questionBreakdown = await Promise.all(
+      questions.map(async (q) => {
+        const studentAns = answerMap.get(q.id) || '';
+        let isCorrect = false;
 
-      if (studentAns.trim().length > 0) {
-        if (q.questionType === QuestionType.MCQ || q.questionType === QuestionType.MULTIPLE_CHOICE) {
-          isCorrect = !!q.correctAnswer && studentAns.trim().toUpperCase() === q.correctAnswer.trim().toUpperCase();
-        } else if (q.questionType === QuestionType.OUTPUT_PREDICTION) {
-          const expected = (q.correctOutput || '').trim();
-          const actual = studentAns.trim();
-          if (q.comparisonMethod === ComparisonMethod.EXACT) {
-            isCorrect = studentAns === q.correctOutput;
-          } else {
-            isCorrect = actual === expected;
+        if (studentAns.trim().length > 0) {
+          if (q.questionType === QuestionType.MCQ || q.questionType === QuestionType.MULTIPLE_CHOICE) {
+            isCorrect = !!q.correctAnswer && studentAns.trim().toUpperCase() === q.correctAnswer.trim().toUpperCase();
+          } else if (q.questionType === QuestionType.OUTPUT_PREDICTION) {
+            const expected = (q.correctOutput || '').trim();
+            const actual = studentAns.trim();
+            if (q.comparisonMethod === ComparisonMethod.EXACT) {
+              isCorrect = studentAns === q.correctOutput;
+            } else {
+              isCorrect = actual === expected;
+            }
           }
         }
-      }
 
-      let marksAwarded = 0;
-      if (studentAns.trim().length > 0) {
-        marksAwarded = isCorrect ? q.marks : -(q.negativeMarks || 0);
-      }
+        let marksAwarded = 0;
+        if (studentAns.trim().length > 0) {
+          marksAwarded = isCorrect ? q.marks : -(q.negativeMarks || 0);
+        }
 
-      return {
-        questionId: q.id,
-        questionText: q.questionText,
-        questionType: q.questionType,
-        code: q.code,
-        marks: q.marks,
-        negativeMarks: q.negativeMarks,
-        correctAnswer: q.correctAnswer,
-        correctOutput: q.correctOutput,
-        comparisonMethod: q.comparisonMethod,
-        studentAnswer: studentAns,
-        isCorrect,
-        marksAwarded,
-        options: q.options,
-      };
-    });
+        const options = await query<DbQuestionOption>(
+          `SELECT * FROM question_options WHERE "questionId" = $1 ORDER BY "order" ASC`,
+          [q.id]
+        );
 
-    const score = await prisma.roundScore.findUnique({
-      where: { studentId_roundId: { studentId: student.id, roundId } },
-    });
+        return {
+          questionId: q.id,
+          questionText: q.questionText,
+          questionType: q.questionType,
+          code: q.code,
+          marks: q.marks,
+          negativeMarks: q.negativeMarks,
+          correctAnswer: q.correctAnswer,
+          correctOutput: q.correctOutput,
+          comparisonMethod: q.comparisonMethod,
+          studentAnswer: studentAns,
+          isCorrect,
+          marksAwarded,
+          options,
+        };
+      })
+    );
 
-    const progress = await prisma.roundProgress.findUnique({
-      where: { studentId_roundId: { studentId: student.id, roundId } },
-    });
+    const score = await queryOne<DbRoundScore>(
+      `SELECT * FROM round_scores WHERE "studentId" = $1 AND "roundId" = $2`,
+      [student.id, roundId]
+    );
+
+    const progress = await queryOne<DbRoundProgress>(
+      `SELECT * FROM round_progress WHERE "studentId" = $1 AND "roundId" = $2`,
+      [student.id, roundId]
+    );
 
     return {
       student: {
@@ -680,33 +626,34 @@ export class Round1Service {
     };
   }
 
-  /**
-   * Retrieves summary leaderboard of all student scores and submission statuses for Round 1.
-   */
   public async getRound1Scores(roundId: string) {
-    const students = await prisma.student.findMany({
-      orderBy: { studentId: 'asc' },
-      include: {
-        scores: { where: { roundId } },
-        progresses: { where: { roundId } },
-      },
-    });
+    const students = await query<{ id: string; studentId: string; fullName: string; batchNumber: string }>(
+      `SELECT id, "studentId", "fullName", "batchNumber" FROM students ORDER BY "studentId" ASC`
+    );
 
-    return students.map((s) => {
-      const score = s.scores[0];
-      const progress = s.progresses[0];
+    return Promise.all(
+      students.map(async (s) => {
+        const score = await queryOne<DbRoundScore>(
+          `SELECT score, "maximumScore" FROM round_scores WHERE "studentId" = $1 AND "roundId" = $2`,
+          [s.id, roundId]
+        );
+        const progress = await queryOne<DbRoundProgress>(
+          `SELECT status, "submittedAt" FROM round_progress WHERE "studentId" = $1 AND "roundId" = $2`,
+          [s.id, roundId]
+        );
 
-      return {
-        id: s.id,
-        studentId: s.studentId,
-        fullName: s.fullName,
-        batchNumber: s.batchNumber,
-        status: progress ? progress.status : 'NOT_STARTED',
-        score: score ? score.score : 0,
-        maximumScore: score ? score.maximumScore : 0,
-        submittedAt: progress ? progress.submittedAt : null,
-      };
-    });
+        return {
+          id: s.id,
+          studentId: s.studentId,
+          fullName: s.fullName,
+          batchNumber: s.batchNumber,
+          status: progress ? progress.status : 'NOT_STARTED',
+          score: score ? score.score : 0,
+          maximumScore: score ? score.maximumScore : 0,
+          submittedAt: progress ? progress.submittedAt : null,
+        };
+      })
+    );
   }
 }
 

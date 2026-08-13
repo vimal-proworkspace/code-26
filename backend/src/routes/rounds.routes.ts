@@ -1,6 +1,7 @@
-import { Router, Request, Response, NextFunction } from 'express';
+import { Router, Response, NextFunction } from 'express';
 import { requireAuth, AuthenticatedRequest } from '../middleware/auth.middleware';
-import { prisma } from '../config/database';
+import { query, queryOne } from '../config/database';
+import { DbEvent, DbRound } from '../config/types';
 
 const router = Router();
 
@@ -15,31 +16,22 @@ router.get(
   async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
     try {
       // Find the primary event
-      const event = await prisma.event.findFirst({
-        orderBy: { createdAt: 'asc' },
-        select: { id: true, name: true, status: true },
-      });
+      const event = await queryOne<DbEvent>(
+        `SELECT id, name, status FROM events ORDER BY "createdAt" ASC LIMIT 1`
+      );
 
       if (!event) {
         res.status(200).json({ status: 'success', data: { event: null, rounds: [] } });
         return;
       }
 
-      const rounds = await prisma.round.findMany({
-        where: { eventId: event.id },
-        orderBy: { order: 'asc' },
-        select: {
-          id: true,
-          name: true,
-          type: true,
-          status: true,
-          order: true,
-          duration: true,
-          isEnabled: true,
-          startTime: true,
-          endTime: true,
-        },
-      });
+      const rounds = await query<DbRound>(
+        `SELECT id, name, type, status, "order", duration, "isEnabled", "startTime", "endTime"
+         FROM rounds
+         WHERE "eventId" = $1
+         ORDER BY "order" ASC`,
+        [event.id]
+      );
 
       res.status(200).json({
         status: 'success',

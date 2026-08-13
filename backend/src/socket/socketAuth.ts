@@ -1,8 +1,8 @@
 import { Socket } from 'socket.io';
-import parseCookie from 'cookie';
-import { UserRole } from '@prisma/client';
+import * as parseCookie from 'cookie';
+import { UserRole, DbSession } from '../config/types';
 import { verifyAuthToken, AUTH_COOKIE_NAME, AuthTokenPayload } from '../utils/jwt';
-import { prisma } from '../config/database';
+import { queryOne } from '../config/database';
 
 export interface AuthenticatedSocketUser {
   userId: string;
@@ -51,32 +51,32 @@ export const socketAuthMiddleware = async (socket: AuthenticatedSocket, next: (e
     }
 
     // 4. Verify session in PostgreSQL database
-    const dbSession = await prisma.session.findUnique({
-      where: { id: payload.sessionId },
-      include: {
-        user: {
-          include: {
-            student: true,
-          },
-        },
-      },
-    });
+    const dbSession = await queryOne<DbSession & { user_id: string; user_role: UserRole; user_username: string; user_isActive: boolean; student_studentId: string | null }>(
+      `SELECT s.*,
+              u.id as user_id, u.role as user_role, u.username as user_username, u."isActive" as "user_isActive",
+              st."studentId" as "student_studentId"
+       FROM sessions s
+       JOIN users u ON u.id = s."userId"
+       LEFT JOIN students st ON st."userId" = u.id
+       WHERE s.id = $1`,
+      [payload.sessionId]
+    );
 
-    if (!dbSession || dbSession.revokedAt || dbSession.expiresAt < new Date()) {
+    if (!dbSession || dbSession.revokedAt || new Date(dbSession.expiresAt) < new Date()) {
       return next(new Error('Session expired or revoked'));
     }
 
-    if (!dbSession.user.isActive) {
+    if (!dbSession.user_isActive) {
       return next(new Error('User account is disabled'));
     }
 
     // Attach authenticated user payload to socket.data
     socket.data.user = {
       userId: dbSession.userId,
-      role: dbSession.user.role,
+      role: dbSession.user_role,
       sessionId: dbSession.id,
-      username: dbSession.user.username,
-      studentId: dbSession.user.student?.studentId,
+      username: dbSession.user_username,
+      studentId: dbSession.student_studentId || undefined,
     };
 
     next();

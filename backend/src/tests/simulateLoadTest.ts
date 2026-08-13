@@ -1,18 +1,17 @@
-import { prisma } from '../config/database';
+import { query, queryOne, closePool } from '../config/database';
 import { createApp } from '../app';
 import request from 'supertest';
-import { UserRole } from '@prisma/client';
-import jwt from 'jsonwebtoken';
-import { config } from '../config/env';
+import { DbStudent, DbUser } from '../config/types';
+import { signAuthToken, AUTH_COOKIE_NAME } from '../utils/jwt';
 
 async function runLoadSimulation(clientCount: number) {
   console.log(`\n--- Starting Load Simulation: ${clientCount} Concurrent Students ---`);
   const app = createApp();
 
-  const students = await prisma.student.findMany({
-    take: clientCount,
-    include: { user: true },
-  });
+  const students = await query<DbStudent & { username: string }>(
+    `SELECT s.*, u.username FROM students s JOIN users u ON u.id = s."userId" LIMIT $1`,
+    [clientCount]
+  );
 
   if (students.length === 0) {
     throw new Error('No student accounts available for load testing');
@@ -25,19 +24,29 @@ async function runLoadSimulation(clientCount: number) {
 
   console.log(`Simulating ${students.length} concurrent authenticated HTTP requests & status lookups...`);
 
-  // Fire parallel requests
   const promises = students.map(async (st) => {
-    const token = jwt.sign(
-      { userId: st.userId, role: UserRole.STUDENT, studentId: st.studentId, username: st.user.username },
-      config.jwtSecret,
-      { expiresIn: '15m' }
+    // Create session in DB for authentic request
+    const session = await queryOne<{ id: string }>(
+      `INSERT INTO sessions (id, "userId", "sessionToken", "createdAt", "expiresAt", "lastSeenAt")
+       VALUES (gen_random_uuid(), $1, gen_random_uuid(), NOW(), NOW() + INTERVAL '1 hour', NOW())
+       RETURNING id`,
+      [st.userId]
     );
+
+    if (!session) return;
+
+    const token = signAuthToken({
+      userId: st.userId,
+      role: 'STUDENT',
+      sessionId: session.id,
+      studentId: st.studentId,
+    });
 
     const reqStart = Date.now();
     try {
       const res = await request(app)
         .get('/api/auth/me')
-        .set('Cookie', [`token=${token}`]);
+        .set('Cookie', [`${AUTH_COOKIE_NAME}=${token}`]);
 
       const reqTime = Date.now() - reqStart;
       latencies.push(reqTime);
@@ -47,7 +56,7 @@ async function runLoadSimulation(clientCount: number) {
       } else {
         errorCount++;
       }
-    } catch (err) {
+    } catch {
       errorCount++;
     }
   });
@@ -92,6 +101,8 @@ async function main() {
   } catch (err) {
     console.error('Load simulation error:', err);
     process.exit(1);
+  } finally {
+    await closePool();
   }
 }
 

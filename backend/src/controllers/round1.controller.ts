@@ -1,17 +1,17 @@
 import { Response, NextFunction } from 'express';
 import { round1Service } from '../services/round1.service';
 import { AuthenticatedRequest } from '../middleware/auth.middleware';
-import { prisma } from '../config/database';
+import { queryOne } from '../config/database';
 
 export class Round1Controller {
   /**
    * Helper to get Student model primary key (id) from authenticated User id.
    */
   private async getStudentId(userId: string): Promise<string> {
-    const student = await prisma.student.findUnique({
-      where: { userId },
-      select: { id: true },
-    });
+    const student = await queryOne<{ id: string }>(
+      `SELECT id FROM students WHERE "userId" = $1`,
+      [userId]
+    );
     if (!student) {
       throw { statusCode: 404, message: 'Student profile not found' };
     }

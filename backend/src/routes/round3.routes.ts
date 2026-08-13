@@ -1,16 +1,11 @@
 import { Router } from 'express';
 import { requireAuth, requireRole } from '../middleware/auth.middleware';
-import { UserRole } from '@prisma/client';
+import { UserRole } from '../config/types';
 import { round3Controller } from '../controllers/round3.controller';
 
 const router = Router();
 
-// Apply base auth middleware
 router.use(requireAuth);
-
-// ==========================================
-// ADMIN ROUTES (requireRole ADMIN)
-// ==========================================
 
 router.get(
   '/admin/rounds/:roundId/problems',
@@ -65,10 +60,6 @@ router.get(
   requireRole(UserRole.ADMIN),
   round3Controller.getRound3Scores.bind(round3Controller)
 );
-
-// ==========================================
-// STUDENT ROUTES (requireRole STUDENT)
-// ==========================================
 
 router.get(
   '/rounds/:roundId/student',

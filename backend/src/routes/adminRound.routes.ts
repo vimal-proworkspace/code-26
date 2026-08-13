@@ -1,12 +1,11 @@
 import { Router } from 'express';
-import { UserRole } from '@prisma/client';
+import { UserRole } from '../config/types';
 import { adminRoundController } from '../controllers/adminRound.controller';
 import { requireAuth } from '../middleware/auth.middleware';
 import { requireRole } from '../middleware/role.middleware';
 
 const router = Router();
 
-// Protect ALL routes: Require Authentication AND ADMIN role
 router.use(requireAuth);
 router.use(requireRole(UserRole.ADMIN));
 
@@ -26,4 +25,3 @@ router.post('/:id/end', (req, res, next) => adminRoundController.endRound(req, r
 router.post('/:id/restart', (req, res, next) => adminRoundController.restartRound(req, res, next));
 
 export default router;
-

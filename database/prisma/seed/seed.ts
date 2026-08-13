@@ -1,5 +1,11 @@
 import { PrismaClient, UserRole, EventStatus, RoundType, RoundStatus } from '@prisma/client';
-import bcrypt from 'bcrypt';
+
+let bcrypt: typeof import('bcrypt');
+try {
+  bcrypt = require('bcrypt');
+} catch {
+  bcrypt = require('../../../backend/node_modules/bcrypt');
+}
 
 const prisma = new PrismaClient();
 
